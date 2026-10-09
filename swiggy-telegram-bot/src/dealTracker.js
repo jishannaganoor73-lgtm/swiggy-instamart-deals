@@ -108,6 +108,12 @@ function getSpecialType(price, discount) {
   return null;
 }
 
+// Historical drops are unusual but may remain at the same price for multiple scans.
+ // Avoid repeating the same historical alert more than once every 6 hours unless
+ // the price improves by another 10% or more versus the last alerted price.
+const HISTORICAL_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const HISTORICAL_REAL_IMPROVEMENT_RATIO = 0.90;
+
 function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', options = {}) {
   const cache = loadCache(campaignKey);
   const alertList = [];
@@ -182,8 +188,17 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
     const exceptionalType = specialType || (historicalSignal && historicalSignal.alertType);
 
     if (exceptionalType) {
-      const sameExceptionalAlert = prevAlertedType === exceptionalType && prevAlertedPrice === price;
-      shouldAlert = !sameExceptionalAlert;
+      const sameExceptionalAlert = prevAlertedType === exceptionalType;
+      if (exceptionalType === 'HISTORICAL_PRICE_DROP' && sameExceptionalAlert) {
+        const lastAlertedAt = Number(prev && prev.lastAlertedAt) || 0;
+        const cooldownExpired = !lastAlertedAt || (now - lastAlertedAt) >= HISTORICAL_ALERT_COOLDOWN_MS;
+        const materiallyLower = Number.isFinite(prevAlertedPrice) &&
+          price <= prevAlertedPrice * HISTORICAL_REAL_IMPROVEMENT_RATIO;
+        shouldAlert = cooldownExpired || materiallyLower;
+      } else {
+        // Preserve existing behavior for ₹1 deals, glitches and major discounts.
+        shouldAlert = !(sameExceptionalAlert && prevAlertedPrice === price);
+      }
       if (shouldAlert) alertType = exceptionalType;
     } else if (isFirstRunOfItemCycle) {
       shouldAlert = true;
@@ -229,6 +244,7 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
       lastAlertedPrice: shouldAlert ? price : (prev ? prev.lastAlertedPrice : undefined),
       lastAlertedDiscount: shouldAlert ? discount : (prev ? prev.lastAlertedDiscount : undefined),
       lastAlertedType: shouldAlert ? alertType : (prev ? prev.lastAlertedType : undefined),
+      lastAlertedAt: shouldAlert ? now : (prev ? prev.lastAlertedAt : undefined),
       lastAlertedDate: shouldAlert ? dateStr : (prev ? prev.lastAlertedDate : undefined),
       lastAlertedHour: shouldAlert ? hour : (prev ? prev.lastAlertedHour : undefined),
       lastAlertedCycle: shouldAlert ? itemCycleId : (prev ? prev.lastAlertedCycle : undefined),
@@ -263,7 +279,8 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
     const discount = Number(item.discount);
     if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(discount)) return false;
     return Boolean(getSpecialType(price, discount)) ||
-      discount >= getThreshold(item, minDiscount);
+      discount >= getThreshold(item, minDiscount) ||
+      Boolean(getHistoricalPriceSignal(item));
   }).length;
 
   const suppressedCount = Math.max(0, qualifyingKeys.size - alertList.length);
