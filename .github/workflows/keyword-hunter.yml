@@ -72,10 +72,26 @@ jobs:
           restore-keys: |
             deal-cache-${{ matrix.worker }}-
 
-      # 5. Run the worker.
+      # 5. Remove this worker's stale price-observation file.
+      # Keep the existing deal cache intact.
+      - name: Remove Stale Price Observations
+        working-directory: swiggy-telegram-bot
+        shell: bash
+        run: |
+          case "${{ matrix.worker }}" in
+            personal)
+              rm -f data/price-observations-personalCare.json
+              ;;
+            *)
+              rm -f "data/price-observations-${{ matrix.worker }}.json"
+              ;;
+          esac
+
+          echo "Prepared a fresh observation file for worker: ${{ matrix.worker }}"
+
+      # 6. Run the worker.
       - name: Run ${{ matrix.worker }} Deal Hunter
         working-directory: swiggy-telegram-bot
-
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -108,15 +124,15 @@ jobs:
           echo "Executing Deal Hunter Worker: ${{ matrix.worker }}..."
           node src/cron-runner.js ${{ matrix.worker }} $EXTRA_FLAGS
 
-      # 6. Save this worker's deal cache.
+      # 7. Save this worker's deal cache.
       - name: Save Deal Cache
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: swiggy-telegram-bot/data
+          path: swiggy-instamart-deals-main/swiggy-telegram-bot/data
           key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}
 
-      # 7. Upload observations for the history merger.
+      # 8. Upload observations for the history merger.
       - name: Upload Price Observations
         if: always()
         uses: actions/upload-artifact@v4
@@ -126,7 +142,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-  # 8. Merge observations after the matrix workers finish.
+  # 9. Merge observations after the matrix workers finish.
   update-history:
     name: Merge and Persist Price History
     needs: hunt
@@ -145,24 +161,30 @@ jobs:
         with:
           node-version: 20
 
-      # 9. Download observations from the workers.
+      # 10. Download observations from the workers.
       - name: Download Worker Observations
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: price-observations-*
           path: swiggy-telegram-bot/data
           merge-multiple: true
 
-      # 10. Merge the observations into persistent history.
+      # 11. Merge only when at least one worker produced observations.
       - name: Merge Price History
         working-directory: swiggy-telegram-bot
-        run: node src/merge-price-history.js
+        shell: bash
+        run: |
+          if compgen -G "data/price-observations-*.json" > /dev/null; then
+            node src/merge-price-history.js
+          else
+            echo "No price observation artifacts were produced; existing history is unchanged."
+          fi
 
-      # 11. Commit the updated history.
+      # 12. Commit the updated history.
       - name: Commit Updated History
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
