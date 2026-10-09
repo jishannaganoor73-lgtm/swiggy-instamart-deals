@@ -15,14 +15,19 @@ function ensureDataDir(filePath) {
 function loadCache(campaignKey = 'default') {
   const filePath = getCacheFilePath(campaignKey);
   ensureDataDir(filePath);
+
   try {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, 'utf8');
       return JSON.parse(content);
     }
   } catch (e) {
-    console.warn(`[DealTracker] Could not load cache for ${campaignKey}, starting fresh:`, e.message);
+    console.warn(
+      `[DealTracker] Could not load cache for ${campaignKey}, starting fresh:`,
+      e.message
+    );
   }
+
   return {
     lastDate: null,
     lastRunId: null,
@@ -36,62 +41,80 @@ function loadCache(campaignKey = 'default') {
 function saveCache(cache, campaignKey = 'default') {
   const filePath = getCacheFilePath(campaignKey);
   ensureDataDir(filePath);
+
   try {
     fs.writeFileSync(filePath, JSON.stringify(cache, null, 2), 'utf8');
   } catch (e) {
-    console.error(`[DealTracker] Error saving cache for ${campaignKey}:`, e.message);
+    console.error(
+      `[DealTracker] Error saving cache for ${campaignKey}:`,
+      e.message
+    );
   }
 }
 
 function getIstWeekStart(istDate, resetDay = 1) {
-  const day = istDate.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  const day = istDate.getUTCDay();
   const diffDays = (day - resetDay + 7) % 7;
   const start = new Date(istDate.getTime() - diffDays * 24 * 60 * 60 * 1000);
   return start.toISOString().slice(0, 10);
 }
 
-function getIstContext(overrideDate = null, overrideHour = null, refreshCycle = 'daily', resetDay = 1) {
+function getIstContext(
+  overrideDate = null,
+  overrideHour = null,
+  refreshCycle = 'daily',
+  resetDay = 1
+) {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
+
   let istDate;
+
   if (overrideDate) {
-    const h = overrideHour !== null ? String(overrideHour).padStart(2, '0') : '00';
+    const h = overrideHour !== null
+      ? String(overrideHour).padStart(2, '0')
+      : '00';
+
     istDate = new Date(`${overrideDate}T${h}:00:00.000Z`);
   } else {
     istDate = new Date(now.getTime() + istOffset);
   }
-  const dateStr = overrideDate || istDate.toISOString().slice(0, 10); // "YYYY-MM-DD"
-  const hour = overrideHour !== null ? overrideHour : istDate.getUTCHours(); // 0 to 23
+
+  const dateStr = overrideDate || istDate.toISOString().slice(0, 10);
+  const hour = overrideHour !== null ? overrideHour : istDate.getUTCHours();
   const minuteSlot = istDate.getUTCMinutes() < 30 ? '00' : '30';
   const runId = `${dateStr}-${hour}:${minuteSlot}`;
 
   const dailyCycleId = `D-${dateStr}`;
   const weekStartStr = getIstWeekStart(istDate, resetDay);
   const weeklyCycleId = `W-${weekStartStr}`;
-  const cycleId = refreshCycle === 'weekly' ? weeklyCycleId : dailyCycleId;
 
-  return { dateStr, hour, runId, cycleId, dailyCycleId, weeklyCycleId, now: now.getTime() };
+  const cycleId = refreshCycle === 'weekly'
+    ? weeklyCycleId
+    : dailyCycleId;
+
+  return {
+    dateStr,
+    hour,
+    runId,
+    cycleId,
+    dailyCycleId,
+    weeklyCycleId,
+    now: now.getTime()
+  };
 }
 
 function normalizeProductName(name) {
   if (!name) return '';
+
   let str = name.trim().toLowerCase();
 
-  // 1. Remove parenthetical descriptions, e.g. (XL, Sky Blue), (Pack of 2), (Freshly made), (Red or Green, ...)
   str = str.replace(/\([^)]*\)/g, ' ');
-
-  // 2. Remove shoe size suffixes like "- 5 uk", "- uk 7", ", 8 uk", "uk 10", "5 uk", "- 6 uk", "uk 6"
   str = str.replace(/[-\s,]+(?:uk\s*\d+|\d+\s*uk)\b/gi, ' ');
-
-  // 3. Remove standalone clothing size tags like "- xl", "- l", "size m", "xl", "xxl", "xxxl"
   str = str.replace(/[-\s,]+(?:xs|s|m|l|xl|xxl|xxxl)\b/gi, ' ');
-
-  // 4. Remove wattage and piece count suffixes e.g. "9w,65k,1piece", "12w,65k,1 piece", "12 w"
   str = str.replace(/\b\d+\s*w\b/gi, ' ');
   str = str.replace(/\b\d+\s*piece(?:s)?\b/gi, ' ');
   str = str.replace(/\b\d+k\b/gi, ' ');
-
-  // 5. Clean up multiple spaces, commas, dashes
   str = str.replace(/[-_,\s]+/g, ' ').trim();
 
   return str;
@@ -101,57 +124,84 @@ function getCanonicalItemKey(item) {
   if (item.parentProductId) {
     return `pid:${item.parentProductId}`;
   }
+
   const norm = normalizeProductName(item.name);
+
   if (norm) {
     return `name:${norm}`;
   }
+
   return (item.name || '').trim().toLowerCase() || String(item.skuId || '');
 }
 
 /**
- * Evaluates a list of fetched items against the minimum discount threshold.
- * 
- * Deal Suppression Logic:
- * 1. Cycle Start (Morning Reset / Weekly Reset):
- *    - Daily items: At 10:00 AM IST (the first run of the day), or when calendar date changes,
- *      deals meeting threshold are alerted to present the day's deals catalog (DAILY_DROP / NEW_DEAL).
- *    - Weekly items (e.g. Electronics / Lifestyle): On weeklyResetDay (Monday) at cycle rollover,
- *      weekly deals refresh (WEEKLY_REFRESH / NEW_DEAL).
- * 2. Subsequent runs (Intra-day 11 AM to 10 PM IST):
- *    - Once an item is alerted during the cycle, it is SUPPRESSED as long as its discount stays the SAME.
- *    - An item is re-alerted on the SAME day ONLY if:
- *        a) It is a NEW deal (never seen before in this cycle), OR
- *        b) Its DISCOUNT PERCENTAGE HAS CHANGED (e.g. 70% -> 80% or 80% -> 75%) while still meeting threshold.
- *    - If an item goes out of stock or dips out of discount and returns later at the SAME discount,
- *      it is NOT re-alerted (suppresses redundant come-and-go spam).
+ * Special alert rules:
+ * - ONE_RUPEE_DEAL: price > 0 and <= ₹1
+ * - POTENTIAL_PRICE_GLITCH: discount >= 90%
+ * - MAJOR_DISCOUNT: discount >= 80%
+ *
+ * Existing cycle-based duplicate suppression is preserved.
  */
-function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', options = {}) {
+function findAlertWorthyDeals(
+  items,
+  minDiscount = 70,
+  campaignKey = 'default',
+  options = {}
+) {
   const cache = loadCache(campaignKey);
   const alertList = [];
+
   const refreshCycle = options.refreshCycle || 'daily';
-  const resetDay = options.weeklyResetDay !== undefined ? options.weeklyResetDay : 1;
+  const resetDay = options.weeklyResetDay !== undefined
+    ? options.weeklyResetDay
+    : 1;
+
   const weeklyCategories = options.weeklyCategories || [];
-  const { dateStr, hour, runId, cycleId, dailyCycleId, weeklyCycleId, now } = getIstContext(
+
+  const {
+    dateStr,
+    hour,
+    runId,
+    cycleId,
+    dailyCycleId,
+    weeklyCycleId,
+    now
+  } = getIstContext(
     options.overrideDate,
     options.overrideHour,
     refreshCycle,
     resetDay
   );
 
-  // Daily cycle first run: date change or morning kickoff run (09:00 AM or 10:00 AM IST)
-  const isDailyFirstRun = (cache.lastDailyCycleId !== dailyCycleId)
-    || (!cache.lastDailyCycleId && cache.lastDate !== dateStr)
-    || ((hour === 9 || hour === 10) && (cache.lastRunHour === null || cache.lastRunHour < 9));
+  const isDailyFirstRun =
+    cache.lastDailyCycleId !== dailyCycleId ||
+    (!cache.lastDailyCycleId && cache.lastDate !== dateStr) ||
+    ((hour === 9 || hour === 10) &&
+      (cache.lastRunHour === null || cache.lastRunHour < 9));
 
-  // Weekly cycle first run: weekly cycle ID rollover on resetDay
-  const isWeeklyFirstRun = (cache.lastWeeklyCycleId !== weeklyCycleId)
-    || (!cache.lastWeeklyCycleId && cache.lastCycleId !== cycleId && refreshCycle === 'weekly');
+  const isWeeklyFirstRun =
+    cache.lastWeeklyCycleId !== weeklyCycleId ||
+    (!cache.lastWeeklyCycleId &&
+      cache.lastCycleId !== cycleId &&
+      refreshCycle === 'weekly');
 
-  const lastRunId = cache.lastRunId;
   const seenInCurrentRun = new Map();
 
   for (const item of items) {
+    const price = Number(item.price);
+    const mrp = Number(item.mrp);
+    const discount = Number(item.discount);
+
+    if (!Number.isFinite(price) || price <= 0) {
+      continue;
+    }
+
+    if (!Number.isFinite(discount)) {
+      continue;
+    }
+
     let threshold = 70;
+
     if (typeof minDiscount === 'object' && minDiscount !== null) {
       threshold = item.dealType === 'essential'
         ? (minDiscount.essentials || 70)
@@ -160,85 +210,136 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
       threshold = minDiscount;
     }
 
-    if (item.discount < threshold) continue;
+    const isOneRupeeDeal = price <= 1;
+    const isPotentialGlitch = discount >= 90;
+    const isMajorDiscount = discount >= 80;
 
-    const itemKey = getCanonicalItemKey(item);
-    if (!itemKey) continue;
-
-    // Intra-run deduplication: if multiple variants/sizes of the same product exist in this batch
-    if (seenInCurrentRun.has(itemKey)) {
-      const existingAlert = seenInCurrentRun.get(itemKey);
-      if (item.price < existingAlert.price) {
-        // Update alert with the cheaper variant
-        existingAlert.price = item.price;
-        existingAlert.mrp = item.mrp;
-        existingAlert.discount = item.discount;
-        existingAlert.name = item.name;
-        existingAlert.searchLink = item.searchLink;
-        if (cache.items[itemKey]) {
-          cache.items[itemKey].price = item.price;
-          cache.items[itemKey].discount = item.discount;
-          if (existingAlert.alertType) {
-            cache.items[itemKey].lastAlertedPrice = item.price;
-            cache.items[itemKey].lastAlertedDiscount = item.discount;
-          }
-        }
-      }
+    // Special deals bypass the normal discount threshold.
+    if (
+      !isOneRupeeDeal &&
+      !isPotentialGlitch &&
+      !isMajorDiscount &&
+      discount < threshold
+    ) {
       continue;
     }
 
-    // Determine cycle for this specific item:
-    // If weeklyCategories includes item.category, or if campaign-level refreshCycle is weekly
-    const isItemWeekly = (weeklyCategories && weeklyCategories.includes(item.category))
-      || (refreshCycle === 'weekly');
+    let specialType = null;
+
+    if (isOneRupeeDeal) {
+      specialType = 'ONE_RUPEE_DEAL';
+    } else if (isPotentialGlitch) {
+      specialType = 'POTENTIAL_PRICE_GLITCH';
+    } else if (isMajorDiscount) {
+      specialType = 'MAJOR_DISCOUNT';
+    }
+
+    const itemKey = getCanonicalItemKey(item);
+
+    if (!itemKey) {
+      continue;
+    }
+
+    // Avoid duplicate product variants in the same batch.
+    if (seenInCurrentRun.has(itemKey)) {
+      const existingAlert = seenInCurrentRun.get(itemKey);
+
+      if (price < existingAlert.price) {
+        existingAlert.price = price;
+        existingAlert.mrp = Number.isFinite(mrp) ? mrp : existingAlert.mrp;
+        existingAlert.discount = discount;
+        existingAlert.name = item.name;
+        existingAlert.searchLink = item.searchLink;
+
+        if (cache.items[itemKey]) {
+          cache.items[itemKey].price = price;
+          cache.items[itemKey].discount = discount;
+
+          if (existingAlert.alertType) {
+            cache.items[itemKey].lastAlertedPrice = price;
+            cache.items[itemKey].lastAlertedDiscount = discount;
+          }
+        }
+      }
+
+      continue;
+    }
+
+    const isItemWeekly =
+      (weeklyCategories && weeklyCategories.includes(item.category)) ||
+      refreshCycle === 'weekly';
+
     const itemCycle = isItemWeekly ? 'weekly' : 'daily';
     const itemCycleId = isItemWeekly ? weeklyCycleId : dailyCycleId;
-    const isFirstRunOfItemCycle = isItemWeekly ? isWeeklyFirstRun : isDailyFirstRun;
+    const isFirstRunOfItemCycle = isItemWeekly
+      ? isWeeklyFirstRun
+      : isDailyFirstRun;
 
     const prev = cache.items[itemKey];
-    const prevAlertedDisc = prev ? (prev.lastAlertedDiscount !== undefined ? prev.lastAlertedDiscount : prev.discount) : null;
-    const prevAlertedPrice = prev ? (prev.lastAlertedPrice !== undefined ? prev.lastAlertedPrice : prev.price) : null;
 
-    // Has discount percentage changed from the last alerted discount?
-    const isDiscountChange = prev && prevAlertedDisc !== null && (item.discount !== prevAlertedDisc);
-    const isPriceDrop = isDiscountChange && (item.discount > prevAlertedDisc);
+    const prevAlertedDisc = prev
+      ? (prev.lastAlertedDiscount !== undefined
+          ? prev.lastAlertedDiscount
+          : prev.discount)
+      : null;
+
+    const prevAlertedPrice = prev
+      ? (prev.lastAlertedPrice !== undefined
+          ? prev.lastAlertedPrice
+          : prev.price)
+      : null;
+
+    const isDiscountChange =
+      prev &&
+      prevAlertedDisc !== null &&
+      discount !== prevAlertedDisc;
+
+    const isPriceDrop = isDiscountChange && discount > prevAlertedDisc;
 
     const alreadyAlertedInCycle = prev && (
-      (prev.lastAlertedCycle && prev.lastAlertedCycle === itemCycleId) ||
-      (!prev.lastAlertedCycle && itemCycle === 'daily' && prev.lastAlertedDate === dateStr)
+      (prev.lastAlertedCycle &&
+        prev.lastAlertedCycle === itemCycleId) ||
+      (!prev.lastAlertedCycle &&
+        itemCycle === 'daily' &&
+        prev.lastAlertedDate === dateStr)
     );
 
     let shouldAlert = false;
     let alertType = 'NEW_DEAL';
 
     if (isFirstRunOfItemCycle) {
-      // First run of the cycle (daily morning reset at 10:00 AM IST or weekly reset on resetDay)
       shouldAlert = true;
-      alertType = prev ? (itemCycle === 'weekly' ? 'WEEKLY_REFRESH' : 'DAILY_DROP') : 'NEW_DEAL';
+      alertType = prev
+        ? (itemCycle === 'weekly' ? 'WEEKLY_REFRESH' : 'DAILY_DROP')
+        : 'NEW_DEAL';
     } else if (!prev || !alreadyAlertedInCycle) {
-      // Brand new item or first time meeting criteria in this cycle
       shouldAlert = true;
       alertType = 'NEW_DEAL';
     } else if (isDiscountChange) {
-      // Discount percentage changed while still meeting threshold (e.g., 70% -> 80% or 80% -> 75%)
       shouldAlert = true;
       alertType = isPriceDrop ? 'PRICE_DROP' : 'DISCOUNT_CHANGE';
-    } else {
-      // Already alerted in this cycle at the SAME discount:
-      // Suppress duplicate alert (even if item flickered out of stock or below threshold and returned at same discount).
-      shouldAlert = false;
+    }
+
+    // Give special deals a distinct Telegram alert type.
+    // The special label takes precedence over ordinary cycle labels.
+    if (shouldAlert && specialType) {
+      alertType = specialType;
     }
 
     if (shouldAlert) {
       const alertObj = {
         ...item,
+        price,
+        mrp: Number.isFinite(mrp) ? mrp : item.mrp,
+        discount,
         alertType,
-        prevPrice: prev ? (prev.lastAlertedPrice !== undefined ? prev.lastAlertedPrice : prev.price) : null,
-        prevDiscount: prev ? (prev.lastAlertedDiscount !== undefined ? prev.lastAlertedDiscount : prev.discount) : null,
+        prevPrice: prevAlertedPrice,
+        prevDiscount: prev ? prevAlertedDisc : null,
         campaignKey,
         dealType: item.dealType || campaignKey,
         searchQuery: item.searchQuery || ''
       };
+
       alertList.push(alertObj);
       seenInCurrentRun.set(itemKey, alertObj);
 
@@ -247,11 +348,11 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
         category: item.category || '',
         skuId: item.skuId || null,
         parentProductId: item.parentProductId || null,
-        price: item.price,
-        mrp: item.mrp,
-        discount: item.discount,
-        lastAlertedPrice: item.price,
-        lastAlertedDiscount: item.discount,
+        price,
+        mrp: Number.isFinite(mrp) ? mrp : item.mrp,
+        discount,
+        lastAlertedPrice: price,
+        lastAlertedDiscount: discount,
         lastAlertedDate: dateStr,
         lastAlertedHour: hour,
         lastAlertedCycle: itemCycleId,
@@ -260,17 +361,17 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
         lastSeen: now
       };
     } else {
-      // Keep tracking presence in cache without triggering Telegram alert
-      seenInCurrentRun.set(itemKey, { price: item.price });
+      seenInCurrentRun.set(itemKey, { price });
+
       if (!cache.items[itemKey]) {
         cache.items[itemKey] = {
           name: item.name,
           category: item.category || '',
           skuId: item.skuId || null,
           parentProductId: item.parentProductId || null,
-          price: item.price,
-          mrp: item.mrp,
-          discount: item.discount,
+          price,
+          mrp: Number.isFinite(mrp) ? mrp : item.mrp,
+          discount,
           lastAlertedPrice: null,
           lastAlertedDiscount: null,
           lastAlertedDate: null,
@@ -282,27 +383,61 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
         };
       } else {
         cache.items[itemKey].lastSeenRunId = runId;
-        cache.items[itemKey].price = item.price;
-        cache.items[itemKey].discount = item.discount;
+        cache.items[itemKey].price = price;
+        cache.items[itemKey].mrp = Number.isFinite(mrp)
+          ? mrp
+          : cache.items[itemKey].mrp;
+        cache.items[itemKey].discount = discount;
         cache.items[itemKey].lastSeen = now;
       }
     }
   }
 
-  // Sort deals descending by discount percentage (highest discount first)
-  alertList.sort((a, b) => b.discount - a.discount);
+  // Highest discounts first; special deal types are handled by notifier.js.
+  alertList.sort((a, b) => {
+    const specialPriority = {
+      ONE_RUPEE_DEAL: 3,
+      POTENTIAL_PRICE_GLITCH: 2,
+      MAJOR_DISCOUNT: 1
+    };
 
-  const totalMetCriteria = items.filter(it => it.discount >= (typeof minDiscount === 'number' ? minDiscount : 70)).length;
+    const priorityA = specialPriority[a.alertType] || 0;
+    const priorityB = specialPriority[b.alertType] || 0;
+
+    if (priorityA !== priorityB) {
+      return priorityB - priorityA;
+    }
+
+    return b.discount - a.discount;
+  });
+
+  const totalMetCriteria = items.filter((item) => {
+    const discount = Number(item.discount);
+    const price = Number(item.price);
+
+    return (
+      (Number.isFinite(price) && price > 0 && price <= 1) ||
+      (Number.isFinite(discount) &&
+        (discount >= thresholdForSummary(minDiscount) ||
+          discount >= 80))
+    );
+  }).length;
+
   const suppressedCount = Math.max(0, totalMetCriteria - alertList.length);
-  console.log(`[DealTracker:${campaignKey}] Total Scanned: ${items.length} | Meets Criteria: ${totalMetCriteria} | Alerts Sent: ${alertList.length} | Suppressed Duplicates: ${suppressedCount} (Cycle: ${refreshCycle}/${cycleId})`);
 
-  // Update run metadata
+  console.log(
+    `[DealTracker:${campaignKey}] Total Scanned: ${items.length} | ` +
+    `Meets Criteria: ${totalMetCriteria} | Alerts Sent: ${alertList.length} | ` +
+    `Suppressed Duplicates: ${suppressedCount} (Cycle: ${refreshCycle}/${cycleId})`
+  );
+
   cache.lastDate = dateStr;
   cache.lastRunHour = hour;
   cache.lastRunId = runId;
   cache.lastCycleId = cycleId;
   cache.lastDailyCycleId = dailyCycleId;
   cache.lastWeeklyCycleId = weeklyCycleId;
+
   cache.lastRuns[runId] = {
     timestamp: now,
     cycleId,
@@ -313,17 +448,28 @@ function findAlertWorthyDeals(items, minDiscount = 70, campaignKey = 'default', 
   };
 
   saveCache(cache, campaignKey);
+
   return alertList;
+}
+
+function thresholdForSummary(minDiscount) {
+  if (typeof minDiscount === 'number') {
+    return minDiscount;
+  }
+
+  return 70;
 }
 
 function getCachedDeals(campaignKey = 'default', minDiscount = 0) {
   const cache = loadCache(campaignKey);
   const result = [];
-  for (const [key, val] of Object.entries(cache.items || {})) {
+
+  for (const [, val] of Object.entries(cache.items || {})) {
     if (val.discount >= minDiscount) {
       result.push(val);
     }
   }
+
   result.sort((a, b) => b.discount - a.discount);
   return result;
 }
