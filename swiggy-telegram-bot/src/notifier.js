@@ -1,4 +1,4 @@
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function escapeHtml(text) {
   return String(text ?? '')
@@ -12,45 +12,40 @@ function getAlertLabel(deal) {
   switch (deal.alertType) {
     case 'ONE_RUPEE_DEAL':
       return '🔥 <b>₹1 DEAL ALERT</b>';
-
     case 'POTENTIAL_PRICE_GLITCH':
       return '🚨 <b>POTENTIAL PRICE GLITCH</b>';
-
+    case 'HISTORICAL_PRICE_DROP':
+      return '📉 <b>UNUSUAL HISTORICAL PRICE DROP</b>';
     case 'MAJOR_DISCOUNT':
       return '📉 <b>MAJOR DISCOUNT</b>';
-
     case 'PRICE_DROP':
       return '💰 <b>PRICE DROP</b>';
-
     default:
       return '🛍️ <b>DEAL</b>';
   }
 }
 
-/**
- * Format one deal with its alert category.
- */
 function formatCompactItem(deal, index = null) {
   const directUrl = deal.searchLink ||
     `https://www.swiggy.com/instamart/search?custom_back=true&query=${encodeURIComponent(deal.name || '')}`;
-
-  // Escape HTML-sensitive characters in the URL as well.
   const safeUrl = escapeHtml(directUrl);
   const num = index !== null ? `${index}. ` : '• ';
   const price = Number(deal.price);
   const mrp = Number(deal.mrp);
   const discount = Number(deal.discount);
-
   const priceText = Number.isFinite(price) ? price.toFixed(2).replace(/\.00$/, '') : 'N/A';
   const mrpText = Number.isFinite(mrp) ? mrp.toFixed(2).replace(/\.00$/, '') : 'N/A';
   const discountText = Number.isFinite(discount) ? `${discount}% OFF` : 'Discount unavailable';
 
-  return (
-    `${num}${getAlertLabel(deal)}\n` +
-    `<b>${escapeHtml(deal.name || 'Unknown product')}</b>\n` +
-    `MRP: ₹${mrpText} | Price: ₹${priceText} | <b>${discountText}</b>\n` +
-    `<a href="${safeUrl}">View product</a>`
-  );
+  let historicalText = '';
+  if (deal.alertType === 'HISTORICAL_PRICE_DROP' &&
+      Number.isFinite(Number(deal.historicalMedian))) {
+    historicalText =
+      `\nHistorical median: ₹${Number(deal.historicalMedian).toFixed(2).replace(/\.00$/, '')}` +
+      ` | Drop: ${Number(deal.historicalDropPercent) || 0}%`;
+  }
+
+  return `${num}${getAlertLabel(deal)}\n<b>${escapeHtml(deal.name || 'Unknown product')}</b>\nMRP: ₹${mrpText} | Price: ₹${priceText} | <b>${discountText}</b>${historicalText}\n<a href="${safeUrl}">View product</a>`;
 }
 
 function formatDealMessage(deal) {
@@ -58,71 +53,42 @@ function formatDealMessage(deal) {
 }
 
 async function sendDealAlert(bot, chatId, deal) {
-  const text = formatCompactItem(deal);
-
-  try {
-    await bot.sendMessage(chatId, text, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
-    });
-    return true;
-  } catch (err) {
-    console.error('[Notifier] Failed to send alert for:', deal.name, err.message);
-    return false;
-  }
+  const message = formatDealMessage(deal);
+  return bot.sendMessage(chatId, message, {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
+  });
 }
 
-/**
- * Send consolidated deal alerts, respecting Telegram's message length limit.
- */
 async function sendBatchAlerts(bot, chatId, deals, options = {}) {
-  if (!deals || !deals.length) return;
+  if (!bot || !chatId || !Array.isArray(deals) || deals.length === 0) return;
 
-  console.log(
-    `[Notifier] Sending ${deals.length} deals in consolidated message(s) to chat ${chatId}…`
-  );
+  const workerInfo = options.workerInfo || 'Instamart Deals';
+  const timeString = options.timeString || '';
+  const header = `<b>${escapeHtml(workerInfo)}</b>${timeString ? `\n${escapeHtml(timeString)}` : ''}\n\n`;
+  const chunks = [];
+  let current = header;
 
-  const timeTag = options.timeString
-    ? ` • ${escapeHtml(options.timeString)}`
-    : '';
-
-  const headerTag = options.workerInfo
-    ? `<b>[${escapeHtml(options.workerInfo)} • ${deals.length} Found${timeTag}]</b>\n\n`
-    : `<b>[Instamart Deals • ${deals.length} Found${timeTag}]</b>\n\n`;
-
-  const messages = [];
-  let currentMsg = headerTag;
-
-  for (let i = 0; i < deals.length; i++) {
-    const itemText = formatCompactItem(deals[i], i + 1) + '\n\n';
-
-    if ((currentMsg + itemText).length > 3800) {
-      if (currentMsg.trim()) {
-        messages.push(currentMsg.trim());
-      }
-      currentMsg = itemText;
-    } else {
-      currentMsg += itemText;
+  for (const deal of deals) {
+    const itemText = `${formatCompactItem(deal)}\n\n`;
+    if (current.length + itemText.length > 3800 && current !== header) {
+      chunks.push(current.trim());
+      current = header;
     }
+    current += itemText;
   }
+  if (current.trim() !== header.trim()) chunks.push(current.trim());
 
-  if (currentMsg.trim()) {
-    messages.push(currentMsg.trim());
-  }
-
-  for (let i = 0; i < messages.length; i++) {
+  for (let i = 0; i < chunks.length; i++) {
     try {
-      await bot.sendMessage(chatId, messages[i], {
+      await bot.sendMessage(chatId, chunks[i], {
         parse_mode: 'HTML',
         disable_web_page_preview: true
       });
-    } catch (err) {
-      console.error('[Notifier] Failed to send batch message:', err.message);
+    } catch (error) {
+      console.error('[Notifier] Telegram send failed:', error.message);
     }
-
-    if (i < messages.length - 1) {
-      await sleep(1000);
-    }
+    if (i < chunks.length - 1) await sleep(1000);
   }
 }
 
