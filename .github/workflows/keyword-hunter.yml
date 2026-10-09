@@ -2,11 +2,12 @@ name: Swiggy Instamart Keyword Deal Hunter
 
 on:
   schedule:
-    # 30-Minute Interval Deal Hunter (09:01 AM to 12:01 AM midnight IST):
-    # Slot 1 (:01 past hour): 09:01 AM IST (03:31 UTC) through 12:01 AM midnight IST (18:31 UTC)
+    # Slot 1: 09:01 AM to 12:01 AM IST
     - cron: '31 3-18 * * *'
-    # Slot 2 (:31 past hour): 09:31 AM IST (04:01 UTC) through 11:31 PM IST (18:01 UTC)
+
+    # Slot 2: 09:31 AM to 11:31 PM IST
     - cron: '1 4-18 * * *'
+
   workflow_dispatch:
     inputs:
       skip_sync:
@@ -14,34 +15,55 @@ on:
         type: boolean
         required: false
         default: false
+
+# Avoid overlapping workflow runs that could conflict when saving history.
+concurrency:
+  group: swiggy-instamart-deal-hunter
+  cancel-in-progress: false
+
+# Allow the workflow to commit price-history updates.
 permissions:
   contents: write
+  actions: read
 
 jobs:
   hunt:
     name: Worker (${{ matrix.worker }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
-        worker: [fresh, grocery, treats, munchies, beverages, personal, lifestyle]
+        worker:
+          - fresh
+          - grocery
+          - treats
+          - munchies
+          - beverages
+          - personal
+          - lifestyle
+
     steps:
+      # 1. Download repository code.
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Configure Node.js.
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
-          cache-dependency-path: 'swiggy-telegram-bot/package-lock.json'
+          cache: npm
+          cache-dependency-path: swiggy-telegram-bot/package-lock.json
 
+      # 3. Install dependencies.
       - name: Install Dependencies
         working-directory: swiggy-telegram-bot
         run: npm ci || npm install
 
+      # 4. Restore this worker's existing deal cache.
       - name: Restore Deal Cache
         uses: actions/cache/restore@v4
         with:
@@ -50,15 +72,19 @@ jobs:
           restore-keys: |
             deal-cache-${{ matrix.worker }}-
 
+      # 5. Run the worker.
       - name: Run ${{ matrix.worker }} Deal Hunter
         working-directory: swiggy-telegram-bot
+
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
           SWIGGY_STORE_ID: ${{ secrets.SWIGGY_STORE_ID }}
           SWIGGY_PRIMARY_STORE_ID: ${{ secrets.SWIGGY_PRIMARY_STORE_ID }}
           SWIGGY_SECONDARY_STORE_ID: ${{ secrets.SWIGGY_SECONDARY_STORE_ID }}
           SWIGGY_COOKIE: ${{ secrets.SWIGGY_COOKIE }}
+
           FRESH_MIN_DISCOUNT: ${{ secrets.FRESH_MIN_DISCOUNT || secrets.ESSENTIALS_MIN_DISCOUNT }}
           GROCERY_MIN_DISCOUNT: ${{ secrets.GROCERY_MIN_DISCOUNT || secrets.ESSENTIALS_MIN_DISCOUNT }}
           ESSENTIALS_MIN_DISCOUNT: ${{ secrets.ESSENTIALS_MIN_DISCOUNT }}
@@ -67,20 +93,85 @@ jobs:
           LIFESTYLE_MIN_DISCOUNT: ${{ secrets.LIFESTYLE_MIN_DISCOUNT }}
           BEVERAGES_MIN_DISCOUNT: ${{ secrets.BEVERAGES_MIN_DISCOUNT }}
           PERSONAL_MIN_DISCOUNT: ${{ secrets.PERSONAL_MIN_DISCOUNT }}
+
           USE_BROWSER: 'true'
           SKIP_SYNC: ${{ inputs.skip_sync }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+
         run: |
           EXTRA_FLAGS=""
+
           if [ "$SKIP_SYNC" = "true" ]; then
             EXTRA_FLAGS="--skip-sync"
           fi
+
           echo "Executing Deal Hunter Worker: ${{ matrix.worker }}..."
           node src/cron-runner.js ${{ matrix.worker }} $EXTRA_FLAGS
 
+      # 6. Save this worker's deal cache.
       - name: Save Deal Cache
         uses: actions/cache/save@v4
         if: always()
         with:
           path: swiggy-telegram-bot/data
           key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}
+
+      # 7. Upload observations for the history merger.
+      - name: Upload Price Observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-observations-${{ matrix.worker }}
+          path: swiggy-telegram-bot/data/price-observations-*.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # 8. Merge observations after the matrix workers finish.
+  update-history:
+    name: Merge and Persist Price History
+    needs: hunt
+    if: always() && needs.hunt.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 9. Download observations from the workers.
+      - name: Download Worker Observations
+        uses: actions/download-artifact@v4
+        with:
+          pattern: price-observations-*
+          path: swiggy-telegram-bot/data
+          merge-multiple: true
+
+      # 10. Merge the observations into persistent history.
+      - name: Merge Price History
+        working-directory: swiggy-telegram-bot
+        run: node src/merge-price-history.js
+
+      # 11. Commit the updated history.
+      - name: Commit Updated History
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add swiggy-telegram-bot/price-history.json
+
+          if git diff --cached --quiet; then
+            echo "No price-history changes to commit."
+          else
+            git commit -m "Update Instamart price history"
+            git push
+          fi
