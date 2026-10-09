@@ -3,7 +3,12 @@ const path = require('path');
 const { getHistoricalPriceSignal } = require('./priceHistory');
 
 function getCacheFilePath(campaignKey = 'default') {
-  return path.join(__dirname, '..', 'data', `deals_cache_${campaignKey}.json`);
+  return path.join(
+    __dirname,
+    '..',
+    'data',
+    `deals_cache_${campaignKey}.json`
+  );
 }
 
 function ensureDataDir(filePath) {
@@ -17,14 +22,16 @@ function loadCache(campaignKey = 'default') {
   try {
     if (fs.existsSync(filePath)) {
       const cache = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+
       cache.items = cache.items || {};
       cache.lastRuns = cache.lastRuns || {};
+
       return cache;
     }
-  } catch (e) {
+  } catch (error) {
     console.warn(
       `[DealTracker] Could not load cache for ${campaignKey}:`,
-      e.message
+      error.message
     );
   }
 
@@ -45,11 +52,19 @@ function saveCache(cache, campaignKey = 'default') {
   ensureDataDir(filePath);
 
   try {
-    fs.writeFileSync(filePath, JSON.stringify(cache, null, 2), 'utf8');
-  } catch (e) {
+    const temporaryPath = `${filePath}.tmp`;
+
+    fs.writeFileSync(
+      temporaryPath,
+      JSON.stringify(cache, null, 2),
+      'utf8'
+    );
+
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
     console.error(
       `[DealTracker] Error saving cache for ${campaignKey}:`,
-      e.message
+      error.message
     );
   }
 }
@@ -71,33 +86,42 @@ function getIstContext(
 ) {
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
+
   let istDate;
 
   if (overrideDate) {
-    const h = overrideHour !== null
+    const hour = overrideHour !== null
       ? String(overrideHour).padStart(2, '0')
       : '00';
 
-    istDate = new Date(`${overrideDate}T${h}:00:00.000Z`);
+    istDate = new Date(`${overrideDate}T${hour}:00:00.000Z`);
   } else {
     istDate = new Date(now.getTime() + istOffset);
   }
 
   const dateStr = overrideDate || istDate.toISOString().slice(0, 10);
+
   const hour = overrideHour !== null
     ? overrideHour
     : istDate.getUTCHours();
 
   const minuteSlot = istDate.getUTCMinutes() < 30 ? '00' : '30';
+
   const runId = `${dateStr}-${hour}:${minuteSlot}`;
   const dailyCycleId = `D-${dateStr}`;
-  const weeklyCycleId = `W-${getIstWeekStart(istDate, resetDay)}`;
+
+  const weeklyCycleId = `W-${getIstWeekStart(
+    istDate,
+    resetDay
+  )}`;
 
   return {
     dateStr,
     hour,
     runId,
-    cycleId: refreshCycle === 'weekly' ? weeklyCycleId : dailyCycleId,
+    cycleId: refreshCycle === 'weekly'
+      ? weeklyCycleId
+      : dailyCycleId,
     dailyCycleId,
     weeklyCycleId,
     now: now.getTime()
@@ -107,7 +131,9 @@ function getIstContext(
 function normalizeProductName(name) {
   if (!name) return '';
 
-  return name.trim().toLowerCase()
+  return name
+    .trim()
+    .toLowerCase()
     .replace(/\([^)]*\)/g, ' ')
     .replace(/[-\s,]+(?:uk\s*\d+|\d+\s*uk)\b/gi, ' ')
     .replace(/[-\s,]+(?:xs|s|m|l|xl|xxl|xxxl)\b/gi, ' ')
@@ -123,13 +149,17 @@ function getCanonicalItemKey(item) {
     return `pid:${item.parentProductId}`;
   }
 
-  const norm = normalizeProductName(item.name);
-
-  if (norm) {
-    return `name:${norm}`;
+  if (item.skuId) {
+    return `sku:${item.skuId}`;
   }
 
-  return String(item.skuId || item.name || '').trim().toLowerCase();
+  const normalizedName = normalizeProductName(item.name);
+
+  if (normalizedName) {
+    return `name:${normalizedName}`;
+  }
+
+  return '';
 }
 
 function getThreshold(item, minDiscount) {
@@ -145,50 +175,13 @@ function getThreshold(item, minDiscount) {
       ? minDiscount.essentials
       : minDiscount.nonEssentials;
 
-    if (Number.isFinite(Number(value)) && value !== '') {
+    if (value !== undefined && value !== '' &&
+        Number.isFinite(Number(value))) {
       return Number(value);
     }
   }
 
   return 70;
-}
-
-/**
- * Calculate genuine discount eligibility using current price and MRP.
- * The API's reported discount is not trusted for special-deal classification.
- *
- * The ₹1 deal exception is retained from the original implementation.
- */
-function getSpecialType(price, discount, mrp) {
-  if (
-    Number.isFinite(price) &&
-    price > 0 &&
-    price <= 1
-  ) {
-    return 'ONE_RUPEE_DEAL';
-  }
-
-  if (
-    !Number.isFinite(price) ||
-    price <= 1 ||
-    !Number.isFinite(mrp) ||
-    mrp <= 0 ||
-    price >= mrp
-  ) {
-    return null;
-  }
-
-  const actualDiscount = ((mrp - price) / mrp) * 100;
-
-  if (actualDiscount >= 90) {
-    return 'POTENTIAL_PRICE_GLITCH';
-  }
-
-  if (actualDiscount >= 80) {
-    return 'MAJOR_DISCOUNT';
-  }
-
-  return null;
 }
 
 function getActualDiscount(price, mrp) {
@@ -205,10 +198,56 @@ function getActualDiscount(price, mrp) {
   return ((mrp - price) / mrp) * 100;
 }
 
-// Historical alerts are repeated only after six hours,
-// unless the price improves by another 10% or more.
+function getSpecialType(price, discount, mrp) {
+  if (Number.isFinite(price) && price > 0 && price <= 1) {
+    return 'ONE_RUPEE_DEAL';
+  }
+
+  if (
+    !Number.isFinite(price) ||
+    price <= 1 ||
+    !Number.isFinite(mrp) ||
+    mrp <= 0 ||
+    price >= mrp
+  ) {
+    return null;
+  }
+
+  const actualDiscount = getActualDiscount(price, mrp);
+
+  if (actualDiscount >= 90) {
+    return 'POTENTIAL_PRICE_GLITCH';
+  }
+
+  if (actualDiscount >= 80) {
+    return 'MAJOR_DISCOUNT';
+  }
+
+  return null;
+}
+
 const HISTORICAL_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const HISTORICAL_REAL_IMPROVEMENT_RATIO = 0.90;
+
+// Only send another alert when the product price improves
+// by at least 10%, or when the previous alert was sufficiently long ago.
+function shouldRepeatHistoricalAlert(prev, price, now) {
+  if (!prev) return true;
+
+  const previousPrice = Number(prev.lastAlertedPrice);
+  const lastAlertedAt = Number(prev.lastAlertedAt) || 0;
+
+  const materiallyLower =
+    Number.isFinite(previousPrice) &&
+    previousPrice > 0 &&
+    price <= previousPrice * HISTORICAL_REAL_IMPROVEMENT_RATIO;
+
+  const cooldownExpired =
+    !lastAlertedAt ||
+    now - lastAlertedAt >= HISTORICAL_ALERT_COOLDOWN_MS;
+
+  return materiallyLower || cooldownExpired;
+}
 
 function findAlertWorthyDeals(
   items,
@@ -220,6 +259,7 @@ function findAlertWorthyDeals(
   const alertList = [];
 
   const refreshCycle = options.refreshCycle || 'daily';
+
   const resetDay = options.weeklyResetDay !== undefined
     ? options.weeklyResetDay
     : 1;
@@ -241,29 +281,12 @@ function findAlertWorthyDeals(
     resetDay
   );
 
-  const isDailyFirstRun =
-    cache.lastDailyCycleId !== dailyCycleId ||
-    (!cache.lastDailyCycleId && cache.lastDate !== dateStr) ||
-    (
-      (hour === 9 || hour === 10) &&
-      (cache.lastRunHour === null || cache.lastRunHour < 9)
-    );
-
-  const isWeeklyFirstRun =
-    cache.lastWeeklyCycleId !== weeklyCycleId ||
-    (
-      !cache.lastWeeklyCycleId &&
-      cache.lastCycleId !== cycleId &&
-      refreshCycle === 'weekly'
-    );
-
   const seenInCurrentRun = new Map();
   const qualifyingKeys = new Set();
 
   for (const item of items || []) {
     const price = Number(item.price);
     const mrp = Number(item.mrp);
-    const reportedDiscount = Number(item.discount);
 
     if (
       !Number.isFinite(price) ||
@@ -274,27 +297,28 @@ function findAlertWorthyDeals(
       continue;
     }
 
+    const itemKey = getCanonicalItemKey(item);
+
+    if (!itemKey) continue;
+
+    const actualDiscount = getActualDiscount(price, mrp);
+
+    const specialType = getSpecialType(
+      price,
+      Number(item.discount),
+      mrp
+    );
+
     const validGenuineDiscount =
       price > 1 &&
       price < mrp;
 
-    const actualDiscount = getActualDiscount(price, mrp);
-
-    // Use the recalculated discount for all alert decisions.
     const discount = validGenuineDiscount
       ? actualDiscount
       : 0;
 
     const threshold = getThreshold(item, minDiscount);
 
-    const specialType = getSpecialType(
-      price,
-      reportedDiscount,
-      mrp
-    );
-
-    // Historical detection is only considered for products
-    // with a valid current price below their MRP.
     const historicalSignal =
       !specialType && validGenuineDiscount
         ? getHistoricalPriceSignal({
@@ -304,7 +328,6 @@ function findAlertWorthyDeals(
           })
         : null;
 
-    // Reject ordinary products without a genuine qualifying discount.
     if (
       !specialType &&
       !historicalSignal &&
@@ -313,133 +336,76 @@ function findAlertWorthyDeals(
       continue;
     }
 
-    const itemKey = getCanonicalItemKey(item);
-
-    if (!itemKey) {
-      continue;
-    }
-
     qualifyingKeys.add(itemKey);
 
+    // Avoid duplicate entries when the same product appears
+    // multiple times in one worker's product list.
     if (seenInCurrentRun.has(itemKey)) {
       const existing = seenInCurrentRun.get(itemKey);
 
       if (price < existing.price) {
-        Object.assign(existing, item, {
-          price,
-          mrp,
-          discount,
-          alertType:
-            specialType ||
-            (historicalSignal && historicalSignal.alertType) ||
-            existing.alertType
-        });
+        existing.price = price;
+        existing.mrp = mrp;
+        existing.discount = discount;
       }
 
       continue;
     }
 
-    const isItemWeekly =
-      weeklyCategories.includes(item.category) ||
-      refreshCycle === 'weekly';
-
-    const itemCycle = isItemWeekly ? 'weekly' : 'daily';
-
-    const itemCycleId = isItemWeekly
-      ? weeklyCycleId
-      : dailyCycleId;
-
-    const isFirstRunOfItemCycle = isItemWeekly
-      ? isWeeklyFirstRun
-      : isDailyFirstRun;
-
     const prev = cache.items[itemKey];
 
-    const prevAlertedPrice = prev
-      ? Number(prev.lastAlertedPrice ?? prev.price)
+    const previousPrice = prev
+      ? Number(prev.lastAlertedPrice)
+      : NaN;
+
+    const previousType = prev
+      ? prev.lastAlertedType
       : null;
 
-    const prevAlertedDiscount = prev
-      ? Number(prev.lastAlertedDiscount ?? prev.discount)
-      : null;
-
-    const prevAlertedType = prev
-      ? (prev.lastAlertedType || null)
-      : null;
-
-    const alreadyAlertedInCycle = Boolean(prev && (
-      prev.lastAlertedCycle === itemCycleId ||
-      (
-        !prev.lastAlertedCycle &&
-        itemCycle === 'daily' &&
-        prev.lastAlertedDate === dateStr
-      )
-    ));
-
-    const priceChanged =
-      prev &&
-      Number.isFinite(prevAlertedPrice) &&
-      price !== prevAlertedPrice;
-
-    const discountChanged =
-      prev &&
-      Number.isFinite(prevAlertedDiscount) &&
-      Math.abs(discount - prevAlertedDiscount) >= 0.01;
+    const exceptionalType =
+      specialType ||
+      (historicalSignal && historicalSignal.alertType) ||
+      null;
 
     let shouldAlert = false;
     let alertType = 'NEW_DEAL';
 
-    const exceptionalType =
-      specialType ||
-      (historicalSignal && historicalSignal.alertType);
+    if (!prev || !Number.isFinite(previousPrice)) {
+      shouldAlert = true;
+      alertType = exceptionalType || 'NEW_DEAL';
+    } else {
+      const priceIsLower = price < previousPrice;
+      const priceIsSame = price === previousPrice;
 
-    if (exceptionalType) {
-      const sameExceptionalAlert =
-        prevAlertedType === exceptionalType;
+      // Do not resend the same product at the same price.
+      if (priceIsSame) {
+        if (exceptionalType === 'HISTORICAL_PRICE_DROP') {
+          shouldAlert = shouldRepeatHistoricalAlert(
+            prev,
+            price,
+            now
+          );
+        } else if (
+          exceptionalType &&
+          exceptionalType !== previousType
+        ) {
+          shouldAlert = true;
+        } else {
+          shouldAlert = false;
+        }
+      } else if (priceIsLower) {
+        // A lower price is eligible for another alert.
+        shouldAlert = true;
 
-      if (
-        exceptionalType === 'HISTORICAL_PRICE_DROP' &&
-        sameExceptionalAlert
-      ) {
-        const lastAlertedAt =
-          Number(prev && prev.lastAlertedAt) || 0;
-
-        const cooldownExpired =
-          !lastAlertedAt ||
-          (now - lastAlertedAt) >= HISTORICAL_ALERT_COOLDOWN_MS;
-
-        const materiallyLower =
-          Number.isFinite(prevAlertedPrice) &&
-          price <= prevAlertedPrice * HISTORICAL_REAL_IMPROVEMENT_RATIO;
-
-        shouldAlert = cooldownExpired || materiallyLower;
+        alertType = exceptionalType || 'PRICE_DROP';
       } else {
-        // Preserve the existing ₹1, glitch and major-discount behavior.
-        shouldAlert = !(
-          sameExceptionalAlert &&
-          prevAlertedPrice === price
-        );
+        // Higher prices should not trigger repeat deal alerts.
+        shouldAlert = false;
       }
 
-      if (shouldAlert) {
+      if (shouldAlert && exceptionalType) {
         alertType = exceptionalType;
       }
-    } else if (isFirstRunOfItemCycle) {
-      shouldAlert = true;
-
-      alertType = prev
-        ? (itemCycle === 'weekly' ? 'WEEKLY_REFRESH' : 'DAILY_DROP')
-        : 'NEW_DEAL';
-    } else if (!prev || !alreadyAlertedInCycle) {
-      shouldAlert = true;
-      alertType = 'NEW_DEAL';
-    } else if (priceChanged || discountChanged) {
-      shouldAlert = true;
-
-      alertType =
-        Number.isFinite(prevAlertedPrice) && price < prevAlertedPrice
-          ? 'PRICE_DROP'
-          : 'DISCOUNT_CHANGE';
     }
 
     if (shouldAlert) {
@@ -449,8 +415,9 @@ function findAlertWorthyDeals(
         mrp,
         discount,
         alertType,
-        prevPrice: prevAlertedPrice,
-        prevDiscount: prevAlertedDiscount,
+        prevPrice: Number.isFinite(previousPrice)
+          ? previousPrice
+          : undefined,
         historicalMedian: historicalSignal
           ? historicalSignal.historicalMedian
           : undefined,
@@ -475,9 +442,6 @@ function findAlertWorthyDeals(
       lastAlertedPrice: shouldAlert
         ? price
         : (prev ? prev.lastAlertedPrice : undefined),
-      lastAlertedDiscount: shouldAlert
-        ? discount
-        : (prev ? prev.lastAlertedDiscount : undefined),
       lastAlertedType: shouldAlert
         ? alertType
         : (prev ? prev.lastAlertedType : undefined),
@@ -491,7 +455,7 @@ function findAlertWorthyDeals(
         ? hour
         : (prev ? prev.lastAlertedHour : undefined),
       lastAlertedCycle: shouldAlert
-        ? itemCycleId
+        ? cycleId
         : (prev ? prev.lastAlertedCycle : undefined),
       lastSeenRunId: runId,
       firstSeen: prev ? prev.firstSeen : now,
@@ -499,11 +463,9 @@ function findAlertWorthyDeals(
     };
 
     seenInCurrentRun.set(itemKey, {
-      ...item,
       price,
       mrp,
-      discount,
-      alertType: exceptionalType || alertType
+      discount
     });
   }
 
@@ -519,54 +481,17 @@ function findAlertWorthyDeals(
     Number(b.discount || 0) - Number(a.discount || 0)
   );
 
-  const totalMetCriteria = (items || []).filter((item) => {
-    const price = Number(item.price);
-    const mrp = Number(item.mrp);
-    const reportedDiscount = Number(item.discount);
-
-    if (
-      !Number.isFinite(price) ||
-      price <= 0 ||
-      !Number.isFinite(mrp) ||
-      mrp <= 0
-    ) {
-      return false;
-    }
-
-    const specialType = getSpecialType(
-      price,
-      reportedDiscount,
-      mrp
-    );
-
-    const validGenuineDiscount =
-      price > 1 &&
-      price < mrp &&
-      getActualDiscount(price, mrp) >= getThreshold(item, minDiscount);
-
-    const historicalSignal =
-      !specialType && price > 1 && price < mrp
-        ? getHistoricalPriceSignal({
-            ...item,
-            price,
-            mrp
-          })
-        : null;
-
-    return Boolean(specialType) ||
-      validGenuineDiscount ||
-      Boolean(historicalSignal);
-  }).length;
-
   const suppressedCount = Math.max(
     0,
     qualifyingKeys.size - alertList.length
   );
 
   console.log(
-    `[DealTracker:${campaignKey}] Total Scanned: ${(items || []).length} | ` +
-    `Meets Criteria: ${totalMetCriteria} | Alerts: ${alertList.length} | ` +
-    `Suppressed: ${suppressedCount} | Cycle: ${refreshCycle}/${cycleId}`
+    `[DealTracker:${campaignKey}] ` +
+    `Scanned: ${(items || []).length} | ` +
+    `Qualified: ${qualifyingKeys.size} | ` +
+    `Alerts: ${alertList.length} | ` +
+    `Suppressed: ${suppressedCount}`
   );
 
   cache.lastDate = dateStr;
@@ -585,6 +510,19 @@ function findAlertWorthyDeals(
     suppressedCount
   };
 
+  // Bound run-history growth.
+  const runIds = Object.keys(cache.lastRuns);
+
+  if (runIds.length > 200) {
+    runIds
+      .sort((a, b) =>
+        Number(cache.lastRuns[a].timestamp || 0) -
+        Number(cache.lastRuns[b].timestamp || 0)
+      )
+      .slice(0, runIds.length - 200)
+      .forEach((id) => delete cache.lastRuns[id]);
+  }
+
   saveCache(cache, campaignKey);
 
   return alertList;
@@ -594,7 +532,7 @@ function getCachedDeals(campaignKey = 'default', minDiscount = 0) {
   const cache = loadCache(campaignKey);
 
   return Object.values(cache.items || {})
-    .filter((val) => Number(val.discount) >= minDiscount)
+    .filter((item) => Number(item.discount) >= minDiscount)
     .sort((a, b) => Number(b.discount) - Number(a.discount));
 }
 
