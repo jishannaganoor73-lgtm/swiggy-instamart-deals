@@ -19,13 +19,30 @@ function formatPrice(value) {
   });
 }
 
+function getProductUrl(deal) {
+  const fallback =
+    `https://www.swiggy.com/instamart/search?custom_back=true&query=${encodeURIComponent(deal.name || '')}`;
+
+  try {
+    const parsed = new URL(deal.searchLink || deal.itemLink || fallback);
+
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch {
+    // Use the fallback if the supplied URL is invalid.
+  }
+
+  return fallback;
+}
+
 function getAlertLabel(deal) {
   switch (deal.alertType) {
     case 'ONE_RUPEE_DEAL':
       return '🔥 <b>₹1 DEAL</b>';
 
     case 'POTENTIAL_PRICE_GLITCH':
-      return '🚨 <b>PRICE GLITCH</b>';
+      return '🚨 <b>POTENTIAL PRICE GLITCH</b>';
 
     case 'HISTORICAL_PRICE_DROP':
       return '📉 <b>HISTORICAL PRICE DROP</b>';
@@ -37,163 +54,150 @@ function getAlertLabel(deal) {
       return '💰 <b>PRICE DROP</b>';
 
     default:
-      return '🛍️ <b>DEAL ALERT</b>';
+      return '✨ <b>INSTAMART DEAL</b>';
   }
-}
-
-function getProductUrl(deal) {
-  const directUrl = deal.searchLink ||
-    `https://www.swiggy.com/instamart/search?custom_back=true&query=${encodeURIComponent(
-      deal.name || ''
-    )}`;
-
-  // Only allow HTTP(S) links in Telegram messages.
-  try {
-    const parsed = new URL(directUrl);
-
-    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
-      return parsed.toString();
-    }
-  } catch {
-    // Use the safe fallback below.
-  }
-
-  return `https://www.swiggy.com/instamart/search?custom_back=true&query=${encodeURIComponent(
-    deal.name || ''
-  )}`;
 }
 
 function formatCompactItem(deal, index = null) {
   const name = escapeHtml(deal.name || 'Unknown product');
-  const url = escapeHtml(getProductUrl(deal));
-
   const price = Number(deal.price);
   const mrp = Number(deal.mrp);
   const discount = Number(deal.discount);
 
   const priceText = formatPrice(price);
-  const mrpText = formatPrice(mrp);
-
-  const discountText = Number.isFinite(discount)
-    ? `${Math.round(discount)}% OFF`
-    : 'Discount unavailable';
+  const hasMrp = Number.isFinite(mrp) && mrp > 0;
+  const hasDiscount = Number.isFinite(discount);
 
   const savings =
-    Number.isFinite(mrp) &&
-    Number.isFinite(price) &&
-    mrp > price
+    hasMrp && Number.isFinite(price) && mrp > price
       ? mrp - price
       : null;
 
-  const savingsText =
-    savings !== null
-      ? `💸 You save <b>₹${formatPrice(savings)}</b>`
+  const prefix =
+    index !== null
+      ? `<b>${String(index).padStart(2, '0')}.</b> `
       : '';
 
-  const numberPrefix =
-    index !== null ? `<b>${String(index).padStart(2, '0')}.</b> ` : '';
+  const lines = [
+    `${prefix}${getAlertLabel(deal)}`,
+    '',
+    `🛍️ <b>${name}</b>`,
+    '',
+  ];
 
-  let historicalText = '';
+  if (hasMrp) {
+    lines.push(`MRP: <s>₹${formatPrice(mrp)}</s>`);
+  }
+
+  lines.push(
+    `💰 <b>₹${priceText}</b>${hasDiscount ? `  ·  ${Math.round(discount)}% OFF` : ''}`
+  );
+
+  if (savings !== null) {
+    lines.push(`💸 You save <b>₹${formatPrice(savings)}</b>`);
+  }
 
   if (
     deal.alertType === 'HISTORICAL_PRICE_DROP' &&
     Number.isFinite(Number(deal.historicalMedian))
   ) {
-    historicalText =
-      `\n📊 Historical median: ₹${formatPrice(deal.historicalMedian)}` +
-      `\n📉 Below median by: ${Math.round(
-        Number(deal.historicalDropPercent) || 0
-      )}%`;
+    lines.push(
+      '',
+      `📊 Historical median: ₹${formatPrice(deal.historicalMedian)}`,
+      `📉 Below median by: ${Math.round(Number(deal.historicalDropPercent) || 0)}%`
+    );
   }
 
-  const priceLine = Number.isFinite(mrp) && mrp > 0
-    ? `MRP: <s>₹${mrpText}</s>\n`
-    : '';
-
-  return (
-    `${numberPrefix}${getAlertLabel(deal)}\n\n` +
-    `🛍️ <b>${name}</b>\n\n` +
-    `${priceLine}` +
-    `💰 <b>₹${priceText}</b>  ·  <b>${discountText}</b>\n` +
-    (savingsText ? `${savingsText}\n` : '') +
-    `${historicalText}\n` +
-    `\n<a href="${url}">🛒 View Deal</a>`
-  ).trim();
+  return lines.join('\n');
 }
 
 function formatDealMessage(deal) {
-  return (
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `${formatCompactItem(deal)}\n` +
-    `━━━━━━━━━━━━━━━━━━`
-  );
+  return formatCompactItem(deal);
 }
 
-async function sendDealAlert(bot, chatId, deal) {
-  const message = formatDealMessage(deal);
+function getInlineKeyboard(deal) {
+  return {
+    inline_keyboard: [[
+      {
+        text: '🛒 View Deal',
+        url: getProductUrl(deal),
+      },
+    ]],
+  };
+}
 
-  return bot.sendMessage(chatId, message, {
+async function sendOneDeal(bot, chatId, deal, index = null) {
+  const caption = formatCompactItem(deal, index);
+  const options = {
     parse_mode: 'HTML',
+    reply_markup: getInlineKeyboard(deal),
+  };
+
+  if (deal.imageUrl) {
+    try {
+      return await bot.sendPhoto(chatId, deal.imageUrl, {
+        ...options,
+        caption,
+      });
+    } catch (error) {
+      console.warn(
+        '[Notifier] Photo send failed; using text fallback:',
+        error.message
+      );
+    }
+  }
+
+  return bot.sendMessage(chatId, caption, {
+    ...options,
     disable_web_page_preview: true,
   });
 }
 
+async function sendDealAlert(bot, chatId, deal) {
+  if (!bot || !chatId || !deal) return;
+
+  try {
+    return await sendOneDeal(bot, chatId, deal);
+  } catch (error) {
+    console.error('[Notifier] Alert send failed:', error.message);
+  }
+}
+
 async function sendBatchAlerts(bot, chatId, deals, options = {}) {
-  if (
-    !bot ||
-    !chatId ||
-    !Array.isArray(deals) ||
-    deals.length === 0
-  ) {
+  if (!bot || !chatId || !Array.isArray(deals) || deals.length === 0) {
     return;
   }
 
   const workerInfo = options.workerInfo || 'INSTAMART DEALS';
   const timeString = options.timeString || '';
 
-  const header =
-    `✨ <b>${escapeHtml(workerInfo)}</b>\n` +
-    (timeString ? `🕒 ${escapeHtml(timeString)}\n` : '') +
-    `<i>Handpicked deals for you</i>\n\n`;
+  const header = [
+    `✨ <b>${escapeHtml(workerInfo)}</b>`,
+    timeString ? `🕒 ${escapeHtml(timeString)}` : '',
+    `<i>Handpicked deals for you</i>`,
+  ].filter(Boolean).join('\n');
 
-  const chunks = [];
-  let current = header;
-  let dealNumber = 0;
-
-  for (const deal of deals) {
-    dealNumber++;
-
-    const itemText = `${formatCompactItem(deal, dealNumber)}\n\n`;
-
-    // Keep messages safely below Telegram's message-size limit.
-    if (current.length + itemText.length > 3500 && current !== header) {
-      chunks.push(current.trim());
-      current = header;
-      dealNumber = 1;
-    }
-
-    current += `${formatCompactItem(deal, dealNumber)}\n\n`;
+  try {
+    await bot.sendMessage(chatId, header, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+  } catch (error) {
+    console.error('[Notifier] Header send failed:', error.message);
   }
 
-  if (current.trim() !== header.trim()) {
-    chunks.push(current.trim());
-  }
-
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; i < deals.length; i++) {
     try {
-      await bot.sendMessage(chatId, chunks[i], {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      });
+      await sendOneDeal(bot, chatId, deals[i], i + 1);
     } catch (error) {
       console.error(
-        '[Notifier] Telegram send failed:',
+        `[Notifier] Failed to send deal ${i + 1}:`,
         error.message
       );
     }
 
-    if (i < chunks.length - 1) {
-      await sleep(1000);
+    if (i < deals.length - 1) {
+      await sleep(700);
     }
   }
 }
