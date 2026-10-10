@@ -2,7 +2,7 @@ name: Swiggy Instamart Keyword Deal Hunter
 
 on:
   schedule:
-    # Approximately every 30 minutes during the configured UTC hours.
+    # Approximately every 30 minutes during configured UTC hours.
     - cron: '31 3-18 * * *'
     - cron: '1 4-18 * * *'
 
@@ -66,21 +66,23 @@ jobs:
           restore-keys: |
             deal-cache-${{ matrix.worker }}-
 
-      # Clear only this run's price observations.
+      # Remove only this worker's previous observation file.
       - name: Remove Stale Price Observations
         working-directory: swiggy-telegram-bot
         shell: bash
+        env:
+          WORKER: ${{ matrix.worker }}
         run: |
-          case "${{ matrix.worker }}" in
+          case "$WORKER" in
             personal)
               rm -f data/price-observations-personalCare.json
               ;;
             *)
-              rm -f "data/price-observations-${{ matrix.worker }}.json"
+              rm -f "data/price-observations-${WORKER}.json"
               ;;
           esac
 
-          echo "Prepared observations for ${{ matrix.worker }}"
+          echo "Prepared observations for $WORKER"
 
       - name: Run ${{ matrix.worker }} Deal Hunter
         working-directory: swiggy-telegram-bot
@@ -117,7 +119,7 @@ jobs:
           echo "Executing worker: ${{ matrix.worker }}"
           node src/cron-runner.js "${{ matrix.worker }}" $EXTRA_FLAGS
 
-      # Save the worker cache at the correct path.
+      # Save the worker cache.
       - name: Save Deal Cache
         uses: actions/cache/save@v4
         if: always()
@@ -125,12 +127,13 @@ jobs:
           path: swiggy-telegram-bot/data
           key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}
 
+      # Upload only the current worker's observation file.
       - name: Upload Price Observations
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: price-observations-${{ matrix.worker }}
-          path: swiggy-telegram-bot/data/price-observations-*.json
+          path: swiggy-telegram-bot/data/price-observations-${{ matrix.worker == 'personal' && 'personalCare' || matrix.worker }}.json
           if-no-files-found: ignore
           retention-days: 3
 
@@ -185,4 +188,4 @@ jobs:
           else
             git commit -m "Update Instamart price history"
             git push
-          fi
+          fi 
