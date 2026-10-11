@@ -198,53 +198,62 @@ async function main() {
   else if (mode === 'beverages' || mode === 'drinks' || mode === 'juices') runBeverages = true;
   else if (mode === 'personal' || mode === 'personalcare') runPersonal = true;
   else if (mode === 'noice') runNoice = true;
-  else if (isWithinHours) {
+  else if (mode === 'all' || mode === 'glitch') {
+    // Full sweep: every category/aisle + NOICE store, ignoring the operating-hours window.
+    runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
+    runBeverages = true; runPersonal = true; runLifestyle = true; runNoice = true;
+  } else if (isWithinHours) {
     runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
     runBeverages = true; runPersonal = true; runLifestyle = true;
   }
 
   const campaigns = config.campaigns || {};
+  const glitchSweep = mode === 'glitch';
+  const glitchThreshold = parseInt(process.env.GLITCH_MIN_DISCOUNT, 10) || 90;
+  if (glitchSweep) {
+    console.log(`[CronRunner] GLITCH sweep: all categories, alerting on ₹1 deals and >= ${glitchThreshold}% OFF.`);
+  }
 
   if (runFresh) {
     const cfg = campaigns.fresh || campaigns.essentials || {};
-    const threshold = parseInt(process.env.FRESH_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.FRESH_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
     await runSubcategoryCampaign('fresh', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runGrocery) {
     const cfg = campaigns.grocery || campaigns.essentials || {};
-    const threshold = parseInt(process.env.GROCERY_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.GROCERY_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
     await runSubcategoryCampaign('grocery', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runTreats) {
     const cfg = campaigns.treats || {};
-    const threshold = parseInt(process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
     await runSubcategoryCampaign('treats', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runMunchies) {
     const cfg = campaigns.munchies || campaigns.treats || {};
-    const threshold = parseInt(process.env.MUNCHIES_MIN_DISCOUNT || process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.MUNCHIES_MIN_DISCOUNT || process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
     await runSubcategoryCampaign('munchies', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runBeverages) {
     const cfg = campaigns.beverages || {};
-    const threshold = parseInt(process.env.BEVERAGES_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.BEVERAGES_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
     await runSubcategoryCampaign('beverages', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runPersonal) {
     const cfg = campaigns.personalCare || campaigns.personal || {};
-    const threshold = parseInt(process.env.PERSONAL_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.PERSONAL_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
     await runSubcategoryCampaign('personalCare', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runLifestyle) {
     const cfg = campaigns.lifestyle || {};
-    const threshold = parseInt(process.env.LIFESTYLE_MIN_DISCOUNT, 10) || cfg.minDiscount || 85;
+    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.LIFESTYLE_MIN_DISCOUNT, 10) || cfg.minDiscount || 85;
     await runSubcategoryCampaign('lifestyle', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
 
   if (runNoice) {
     console.log('\n--- Running The NOICE Store Scan ---');
     const cfg = campaigns.noice || {};
-    const noiceThreshold = parseInt(process.env.NOICE_MIN_DISCOUNT, 10) || cfg.minDiscount || minDiscount || 50;
+    const noiceThreshold = glitchSweep ? glitchThreshold : parseInt(process.env.NOICE_MIN_DISCOUNT, 10) || cfg.minDiscount || minDiscount || 50;
     try {
       const items = await fetchNoiceDeals(storeConfig);
       console.log(`[NOICE] Scraped ${items.length} items.`);
