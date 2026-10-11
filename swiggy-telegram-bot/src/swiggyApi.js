@@ -151,6 +151,87 @@ const NOICE_SUB_COLLECTIONS = [
   { id: '359943', name: 'Coffee' }, { id: '290645', name: 'Protein Bars' }
 ];
 
+
+function parseCookieHeader(cookieHeader) {
+  return String(cookieHeader || '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part.includes('='))
+    .map((part) => {
+      const idx = part.indexOf('=');
+      return {
+        name: part.slice(0, idx).trim(),
+        value: part.slice(idx + 1).trim(),
+        domain: '.swiggy.com',
+        path: '/',
+        secure: true
+      };
+    })
+    .filter((c) => c.name);
+}
+
+function resolveStore(storeConfig = {}) {
+  const env = getStoreConfig();
+  return {
+    sid: String(storeConfig.sid || env.sid || ''),
+    pid: String(storeConfig.pid || env.pid || ''),
+    secid: String(storeConfig.secid || env.secid || '')
+  };
+}
+
+async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
+  const { sid, pid: rawPid, secid } = resolveStore(storeConfig);
+  const pid = rawPid || sid;
+
+  if (!sid) {
+    throw new Error('SWIGGY_STORE_ID is missing. Set it in .env, config.json or GitHub Secrets.');
+  }
+
+  const executablePath = findBrowserExecutable();
+  if (!executablePath) {
+    throw new Error('No Chrome/Chromium/Edge found. Install one or set PUPPETEER_EXECUTABLE_PATH.');
+  }
+
+  const limits = {
+    collectionPages: envInt('COLLECTION_PAGES', 3, 1, 20),
+    keywordPages: envInt('KEYWORD_PAGES', 2, 1, 20),
+    filterPages: envInt('FILTER_PAGES', 1, 1, 20)
+  };
+
+  const tmpProfile = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'swiggy-profile-'));
+  let browser;
+
+  try {
+    browser = await puppeteer.launch({
+      executablePath,
+      headless: true,
+      userDataDir: tmpProfile,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled'
+      ]
+    });
+
+    const page = await browser.newPage();
+    const headers = getHeaders();
+    await page.setUserAgent(headers['user-agent']);
+    await page.setExtraHTTPHeaders({ 'accept-language': headers['accept-language'] });
+
+    if (process.env.SWIGGY_COOKIE) {
+      const cookies = parseCookieHeader(process.env.SWIGGY_COOKIE);
+      if (cookies.length) await page.setCookie(...cookies).catch(() => {});
+    }
+
+    // Same-origin context so in-page fetch() carries the right cookies and passes CORS.
+    await page.goto('https://www.swiggy.com/instamart', {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000
+    });
+    await sleep(2000 + Math.random() * 1000);
+
     const scraped = await page.evaluate(async (mode, sid, pid, secid, opt) => {
       const matcher = () => {
         const raw = `${Math.floor(10000 + Math.random() * 90000)}${Date.now()}${Math.floor(10000 + Math.random() * 90000)}`;
@@ -211,7 +292,7 @@ const NOICE_SUB_COLLECTIONS = [
         for (let p = 0; p < opt.collectionPages; p++) {
           if (seen.has(offset)) break;
           seen.add(offset);
-          const url = `https://instamart.in/api/instamart/collection/items?collectionId=${encodeURIComponent(id)}&isMonetised=true&${base}&offset=${offset}&serviceLine=INSTAMART`;
+          const url = `https://www.swiggy.com/api/instamart/collection/items?collectionId=${encodeURIComponent(id)}&isMonetised=true&${base}&offset=${offset}&serviceLine=INSTAMART`;
           const r = await request(url);
           if (!r.ok || !r.json?.data) {
             console.warn(`[Instamart] ${label} page ${p + 1} failed (${r.status || 'network'}).`);
@@ -235,7 +316,7 @@ const NOICE_SUB_COLLECTIONS = [
         for (let p = 0; p < opt.keywordPages; p++) {
           if (seen.has(offset)) break;
           seen.add(offset);
-          const url = `https://instamart.in/api/instamart/search/v2?offset=${offset / 32}&ageConsent=false&${base}`;
+          const url = `https://www.swiggy.com/api/instamart/search/v2?offset=${offset / 32}&ageConsent=false&${base}`;
           const body = {
             facets: [],
             sortAttribute: 'discountPercentHighToLow',
@@ -268,7 +349,7 @@ const NOICE_SUB_COLLECTIONS = [
         for (let p = 0; p < opt.filterPages; p++) {
           if (seen.has(offset)) break;
           seen.add(offset);
-          const url = `https://instamart.in/api/instamart/category-listing/filter/v2?${base}&pageNo=${p}&offset=${offset}&page_name=category_listing_filter`;
+          const url = `https://www.swiggy.com/api/instamart/category-listing/filter/v2?${base}&pageNo=${p}&offset=${offset}&page_name=category_listing_filter`;
           const body = {
             categoryName: item.category,
             filterName: item.name,
@@ -325,9 +406,9 @@ const NOICE_SUB_COLLECTIONS = [
       } else if (mode === 'category') {
         const category = opt.categoryObj;
         const url =
-          `https://instamart.in/api/instamart/category-listing?${base}` +
+          `https://www.swiggy.com/api/instamart/category-listing/v2?${base}` +
           `&taxonomyType=${encodeURIComponent(category.tType)}` +
-          `&categoryName=${encodeURIComponent(category.name)}`;
+          `&categoryName=${encodeURIComponent(category.name)}&offset=0`;
 
         const result = await request(url);
 
@@ -472,9 +553,7 @@ function uniqueByKey(items) {
   return sortedItems(map);
 }
 
-async function fetchNoiceDeals(options = {}) {
-  const storeConfig = getStoreConfig();
-
+async function fetchNoiceDeals(storeConfig = {}, options = {}) {
   try {
     const items = await scrapeWithBrowser(
       'noice',
@@ -495,9 +574,7 @@ async function fetchNoiceDeals(options = {}) {
   }
 }
 
-async function fetchWednesdayBazaarDeals(options = {}) {
-  const storeConfig = getStoreConfig();
-
+async function fetchWednesdayBazaarDeals(storeConfig = {}, options = {}) {
   try {
     const items = await scrapeWithBrowser(
       'bazaar',
@@ -518,15 +595,13 @@ async function fetchWednesdayBazaarDeals(options = {}) {
   }
 }
 
-async function fetchCategoryDeals(categoryKey, options = {}) {
+async function fetchCategoryDeals(categoryKey, storeConfig = {}, options = {}) {
   const category = INSTAMART_CATEGORIES[categoryKey];
 
   if (!category) {
     console.warn(`[SwiggyAPI] Unknown category: ${categoryKey}`);
     return [];
   }
-
-  const storeConfig = getStoreConfig();
 
   try {
     const items = await scrapeWithBrowser(
@@ -547,12 +622,10 @@ async function fetchCategoryDeals(categoryKey, options = {}) {
   }
 }
 
-async function fetchKeywordDeals(keywordItems = [], options = {}) {
+async function fetchKeywordDeals(keywordItems = [], storeConfig = {}, options = {}) {
   if (!Array.isArray(keywordItems) || keywordItems.length === 0) {
     return [];
   }
-
-  const storeConfig = getStoreConfig();
 
   try {
     const items = await scrapeWithBrowser(
@@ -578,24 +651,17 @@ async function fetchKeywordDeals(keywordItems = [], options = {}) {
   }
 }
 
-async function fetchEssentialAisleDeals(
-  subcategories = [],
-  options = {}
-) {
+async function fetchEssentialAisleDeals(storeConfig = {}, options = {}) {
+  const subcategories = options.subcategories;
   if (!Array.isArray(subcategories) || subcategories.length === 0) {
     return [];
   }
-
-  const storeConfig = getStoreConfig();
 
   try {
     const items = await scrapeWithBrowser(
       'aisles',
       storeConfig,
-      {
-        ...options,
-        subcategories
-      }
+      { ...options, subcategories }
     );
 
     console.log(
@@ -621,4 +687,3 @@ module.exports = {
   fetchKeywordDeals,
   fetchEssentialAisleDeals
 };
-                                        
