@@ -7,6 +7,8 @@
     "start": "node src/bot.js",
     "cron": "node src/cron-runner.js",
     "server": "node src/server.js",
+    "scan:all": "node src/cron-runner.js all --skip-sync",
+    "scan:glitch": "node src/cron-runner.js glitch --skip-sync",
     "test:fresh": "node src/cron-runner.js fresh --skip-sync",
     "test:grocery": "node src/cron-runner.js grocery --skip-sync",
     "test:treats": "node src/cron-runner.js treats --skip-sync",
