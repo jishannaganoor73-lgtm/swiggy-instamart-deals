@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: swiggy-telegram-bot/data
-          key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}
+          key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             deal-cache-${{ matrix.worker }}-
 
@@ -125,7 +125,7 @@ jobs:
         if: always()
         with:
           path: swiggy-telegram-bot/data
-          key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}
+          key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Upload only the current worker's observation file.
       - name: Upload Price Observations
