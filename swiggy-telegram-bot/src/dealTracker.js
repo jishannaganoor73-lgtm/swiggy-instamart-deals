@@ -145,21 +145,23 @@ function normalizeProductName(name) {
 }
 
 function getCanonicalItemKey(item) {
-  if (item.parentProductId) {
-    return `pid:${item.parentProductId}`;
+  const pack = String(item.pack || '').trim().toLowerCase().replace(/\s+/g, '');
+
+  // A real SKU id identifies one exact pack/variant (skuId falls back to the
+  // product name when Swiggy gives none, so ignore that case).
+  if (item.skuId && item.skuId !== item.name) {
+    return `sku:${item.skuId}`;
   }
 
-  if (item.skuId) {
-    return `sku:${item.skuId}`;
+  // Never merge different pack sizes of the same parent product: their prices
+  // differ and would otherwise look like endless "price drops".
+  if (item.parentProductId) {
+    return `pid:${item.parentProductId}|${pack}`;
   }
 
   const normalizedName = normalizeProductName(item.name);
 
-  if (normalizedName) {
-    return `name:${normalizedName}`;
-  }
-
-  return '';
+  return normalizedName ? `name:${normalizedName}|${pack}` : '';
 }
 
 function getThreshold(item, minDiscount) {
@@ -226,28 +228,19 @@ function getSpecialType(price, discount, mrp) {
   return null;
 }
 
-const HISTORICAL_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
-const HISTORICAL_REAL_IMPROVEMENT_RATIO = 0.90;
+// A repeat alert for the same product needs a REAL improvement, not noise.
+const MIN_PRICE_IMPROVEMENT_RATIO = 0.90; // must be >= 10% cheaper than last alert
 
-// Only send another alert when the product price improves
-// by at least 10%, or when the previous alert was sufficiently long ago.
-function shouldRepeatHistoricalAlert(prev, price, now) {
-  if (!prev) return true;
+const ALERT_PRIORITY = {
+  ONE_RUPEE_DEAL: 4,
+  POTENTIAL_PRICE_GLITCH: 3,
+  HISTORICAL_PRICE_DROP: 2,
+  MAJOR_DISCOUNT: 1
+};
 
-  const previousPrice = Number(prev.lastAlertedPrice);
-  const lastAlertedAt = Number(prev.lastAlertedAt) || 0;
-
-  const materiallyLower =
-    Number.isFinite(previousPrice) &&
-    previousPrice > 0 &&
-    price <= previousPrice * HISTORICAL_REAL_IMPROVEMENT_RATIO;
-
-  const cooldownExpired =
-    !lastAlertedAt ||
-    now - lastAlertedAt >= HISTORICAL_ALERT_COOLDOWN_MS;
-
-  return materiallyLower || cooldownExpired;
-}
+// Products already alerted by any campaign in THIS process (e.g. `all` / `glitch`
+// runs several campaigns back to back), so one product is never sent twice.
+const alertedThisProcess = new Map();
 
 function findAlertWorthyDeals(
   items,
@@ -284,7 +277,26 @@ function findAlertWorthyDeals(
   const seenInCurrentRun = new Map();
   const qualifyingKeys = new Set();
 
-  for (const item of items || []) {
+  const bestByKey = new Map();
+
+  for (const candidate of items || []) {
+    const key = getCanonicalItemKey(candidate);
+    if (!key) continue;
+
+    const candPrice = Number(candidate.price);
+    const old = bestByKey.get(key);
+
+    if (
+      !old ||
+      candPrice < Number(old.price) ||
+      (candPrice === Number(old.price) &&
+        Number(candidate.discount) > Number(old.discount))
+    ) {
+      bestByKey.set(key, candidate);
+    }
+  }
+
+  for (const item of bestByKey.values()) {
     const price = Number(item.price);
     const mrp = Number(item.mrp);
 
@@ -377,25 +389,19 @@ function findAlertWorthyDeals(
       const priceIsLower = price < previousPrice;
       const priceIsSame = price === previousPrice;
 
-      // Do not resend the same product at the same price.
+      // Same price: never resend, unless it has become a MUCH rarer kind of
+      // deal (e.g. ordinary discount -> price glitch / Rs 1).
       if (priceIsSame) {
-        if (exceptionalType === 'HISTORICAL_PRICE_DROP') {
-          shouldAlert = shouldRepeatHistoricalAlert(
-            prev,
-            price,
-            now
-          );
-        } else if (
-          exceptionalType &&
-          exceptionalType !== previousType
-        ) {
-          shouldAlert = true;
-        } else {
-          shouldAlert = false;
-        }
+        shouldAlert =
+          (ALERT_PRIORITY[exceptionalType] || 0) >= 3 &&
+          (ALERT_PRIORITY[exceptionalType] || 0) >
+            (ALERT_PRIORITY[previousType] || 0);
       } else if (priceIsLower) {
-        // A lower price is eligible for another alert.
-        shouldAlert = true;
+        // Only a meaningful drop (>= 10% below the last ALERTED price) or a
+        // fall to Rs 1 counts; tiny wobbles are ignored.
+        shouldAlert =
+          price <= previousPrice * MIN_PRICE_IMPROVEMENT_RATIO ||
+          (specialType === 'ONE_RUPEE_DEAL' && previousPrice > 1);
 
         alertType = exceptionalType || 'PRICE_DROP';
       } else {
@@ -405,6 +411,20 @@ function findAlertWorthyDeals(
 
       if (shouldAlert && exceptionalType) {
         alertType = exceptionalType;
+      }
+    }
+
+    // Remember that this product has now been alerted (even if another
+    // campaign already sent it), so future runs do not repeat it.
+    const recordAlert = shouldAlert;
+
+    if (shouldAlert) {
+      const sentPrice = alertedThisProcess.get(itemKey);
+
+      if (sentPrice !== undefined && price >= sentPrice) {
+        shouldAlert = false;
+      } else {
+        alertedThisProcess.set(itemKey, price);
       }
     }
 
@@ -439,22 +459,22 @@ function findAlertWorthyDeals(
       price,
       mrp,
       discount,
-      lastAlertedPrice: shouldAlert
+      lastAlertedPrice: recordAlert
         ? price
         : (prev ? prev.lastAlertedPrice : undefined),
-      lastAlertedType: shouldAlert
+      lastAlertedType: recordAlert
         ? alertType
         : (prev ? prev.lastAlertedType : undefined),
-      lastAlertedAt: shouldAlert
+      lastAlertedAt: recordAlert
         ? now
         : (prev ? prev.lastAlertedAt : undefined),
-      lastAlertedDate: shouldAlert
+      lastAlertedDate: recordAlert
         ? dateStr
         : (prev ? prev.lastAlertedDate : undefined),
-      lastAlertedHour: shouldAlert
+      lastAlertedHour: recordAlert
         ? hour
         : (prev ? prev.lastAlertedHour : undefined),
-      lastAlertedCycle: shouldAlert
+      lastAlertedCycle: recordAlert
         ? cycleId
         : (prev ? prev.lastAlertedCycle : undefined),
       lastSeenRunId: runId,
@@ -469,12 +489,7 @@ function findAlertWorthyDeals(
     });
   }
 
-  const priority = {
-    ONE_RUPEE_DEAL: 4,
-    POTENTIAL_PRICE_GLITCH: 3,
-    HISTORICAL_PRICE_DROP: 2,
-    MAJOR_DISCOUNT: 1
-  };
+  const priority = ALERT_PRIORITY;
 
   alertList.sort((a, b) =>
     (priority[b.alertType] || 0) - (priority[a.alertType] || 0) ||
