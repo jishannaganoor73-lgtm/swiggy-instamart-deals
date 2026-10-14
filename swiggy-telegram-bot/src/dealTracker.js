@@ -276,6 +276,7 @@ function findAlertWorthyDeals(
 
   const seenInCurrentRun = new Map();
   const qualifyingKeys = new Set();
+  const suppressionReasons = { samePrice: 0, minorPriceChange: 0, higherPrice: 0, duplicateInProcess: 0 };
 
   const bestByKey = new Map();
 
@@ -396,6 +397,7 @@ function findAlertWorthyDeals(
           (ALERT_PRIORITY[exceptionalType] || 0) >= 3 &&
           (ALERT_PRIORITY[exceptionalType] || 0) >
             (ALERT_PRIORITY[previousType] || 0);
+        if (!shouldAlert) suppressionReasons.samePrice += 1;
       } else if (priceIsLower) {
         // Only a meaningful drop (>= 10% below the last ALERTED price) or a
         // fall to Rs 1 counts; tiny wobbles are ignored.
@@ -403,10 +405,12 @@ function findAlertWorthyDeals(
           price <= previousPrice * MIN_PRICE_IMPROVEMENT_RATIO ||
           (specialType === 'ONE_RUPEE_DEAL' && previousPrice > 1);
 
+        if (!shouldAlert) suppressionReasons.minorPriceChange += 1;
         alertType = exceptionalType || 'PRICE_DROP';
       } else {
         // Higher prices should not trigger repeat deal alerts.
         shouldAlert = false;
+        suppressionReasons.higherPrice += 1;
       }
 
       if (shouldAlert && exceptionalType) {
@@ -416,13 +420,15 @@ function findAlertWorthyDeals(
 
     // Remember that this product has now been alerted (even if another
     // campaign already sent it), so future runs do not repeat it.
-    const recordAlert = shouldAlert;
+    let recordAlert = shouldAlert;
 
     if (shouldAlert) {
       const sentPrice = alertedThisProcess.get(itemKey);
 
       if (sentPrice !== undefined && price >= sentPrice) {
         shouldAlert = false;
+        recordAlert = false;
+        suppressionReasons.duplicateInProcess += 1;
       } else {
         alertedThisProcess.set(itemKey, price);
       }
@@ -508,7 +514,10 @@ function findAlertWorthyDeals(
     `Scanned: ${(items || []).length} | ` +
     `Qualified: ${qualifyingKeys.size} | ` +
     `Alerts: ${alertList.length} | ` +
-    `Suppressed: ${suppressedCount}`
+    `Suppressed: ${suppressedCount}` +
+    (suppressedCount > 0
+      ? ` | Reasons: same-price=${suppressionReasons.samePrice}, minor-drop=${suppressionReasons.minorPriceChange}, higher-price=${suppressionReasons.higherPrice}, duplicate-in-process=${suppressionReasons.duplicateInProcess}`
+      : '')
   );
 
   cache.lastDate = dateStr;
