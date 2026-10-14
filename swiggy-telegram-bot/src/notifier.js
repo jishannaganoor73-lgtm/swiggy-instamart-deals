@@ -196,30 +196,64 @@ function isPriorityDeal(deal) {
   return PRIORITY_TYPES.has(deal.alertType) && confidence >= minConfidence;
 }
 
+function describeError(error) {
+  const status = error?.response?.statusCode;
+  const body = error?.response?.body;
+  const desc = body && (body.description || (typeof body === 'string' ? body : JSON.stringify(body)));
+  return [status ? `HTTP ${status}` : null, desc || error?.message || String(error)]
+    .filter(Boolean)
+    .join(' - ');
+}
+
+// Telegram rate limit (429) -> wait the requested time and retry once.
+async function withRetry(fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    const wait = Number(error?.response?.body?.parameters?.retry_after);
+    if (error?.response?.statusCode === 429 && Number.isFinite(wait) && wait > 0 && wait <= 60) {
+      console.warn(`[Notifier] Rate limited by Telegram; retrying in ${wait}s...`);
+      await sleep((wait + 1) * 1000);
+      return fn();
+    }
+    throw error;
+  }
+}
+
+/**
+ * Sends one group of deals. Returns { sent: [deals], failed: [deals], headerError }.
+ * Never throws, but NEVER hides failures either: callers decide what to do.
+ */
 async function sendGroup(bot, chatId, deals, { header, extra }) {
-  if (deals.length === 0) return;
+  const result = { sent: [], failed: [], headerError: null };
+  if (deals.length === 0) return result;
 
   try {
-    await bot.sendMessage(chatId, header, {
+    await withRetry(() => bot.sendMessage(chatId, header, {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...extra,
-    });
+    }));
   } catch (error) {
-    console.error('[Notifier] Header send failed:', error.message);
+    result.headerError = describeError(error);
+    console.error(`[Notifier] Header send to chat ${chatId} FAILED: ${result.headerError}`);
   }
 
   for (let i = 0; i < deals.length; i++) {
     try {
-      await sendOneDeal(bot, chatId, deals[i], i + 1, extra);
+      await withRetry(() => sendOneDeal(bot, chatId, deals[i], i + 1, extra));
+      result.sent.push(deals[i]);
     } catch (error) {
-      console.error(`[Notifier] Failed to send deal ${i + 1}:`, error.message);
+      result.failed.push(deals[i]);
+      console.error(`[Notifier] Deal ${i + 1}/${deals.length} to chat ${chatId} FAILED: ${describeError(error)}`);
     }
 
     if (i < deals.length - 1) {
       await sleep(700);
     }
   }
+
+  return result;
 }
 
 /**
@@ -230,8 +264,11 @@ async function sendGroup(bot, chatId, deals, { header, extra }) {
  *     (QUIET_NORMAL_ALERTS=false to get sound for them too).
  */
 async function sendBatchAlerts(bot, chatId, deals, options = {}) {
-  if (!bot || !chatId || !Array.isArray(deals) || deals.length === 0) {
-    return;
+  const empty = { sent: [], failed: [] };
+  if (!Array.isArray(deals) || deals.length === 0) return empty;
+  if (!bot || !chatId) {
+    console.error('[Notifier] Cannot send: Telegram bot/chat id not configured. Deals NOT delivered.');
+    return { sent: [], failed: deals };
   }
 
   const workerInfo = options.workerInfo || 'INSTAMART DEALS';
@@ -256,7 +293,7 @@ async function sendBatchAlerts(bot, chatId, deals, options = {}) {
   ].filter(Boolean).join('\n');
 
   // Priority first, loud.
-  await sendGroup(bot, priorityChatId, priorityDeals, {
+  const priorityResult = await sendGroup(bot, priorityChatId, priorityDeals, {
     header: priorityHeader,
     extra: {
       disable_notification: false,
@@ -265,13 +302,50 @@ async function sendBatchAlerts(bot, chatId, deals, options = {}) {
   });
 
   // Then normal deals, quiet by default.
-  await sendGroup(bot, chatId, normalDeals, {
+  const normalResult = await sendGroup(bot, chatId, normalDeals, {
     header: normalHeader,
     extra: {
       disable_notification: quiet,
       ...threadExtra(options.normalThreadId || process.env.NORMAL_THREAD_ID),
     },
   });
+
+  const sent = [...priorityResult.sent, ...normalResult.sent];
+  const failed = [...priorityResult.failed, ...normalResult.failed];
+  console.log(`[Notifier] Delivered ${sent.length}/${deals.length} alerts to Telegram${failed.length ? ` (${failed.length} FAILED)` : ''}.`);
+
+  return { sent, failed };
+}
+
+/**
+ * Verifies the bot token and that the bot can post to the chat(s).
+ * Returns { ok, problems: [string] }.
+ */
+async function verifyTelegram(bot, chatIds) {
+  const problems = [];
+  if (!bot) return { ok: false, problems: ['TELEGRAM_BOT_TOKEN is missing or still the placeholder.'] };
+
+  try {
+    const me = await bot.getMe();
+    console.log(`[Telegram] Bot OK: @${me.username}`);
+  } catch (error) {
+    problems.push(`Bot token rejected by Telegram (getMe): ${describeError(error)}`);
+    return { ok: false, problems };
+  }
+
+  const ids = [...new Set(chatIds.filter(Boolean).map(String))];
+  if (ids.length === 0) problems.push('TELEGRAM_CHAT_ID is missing/empty.');
+
+  for (const id of ids) {
+    try {
+      const chat = await bot.getChat(id);
+      console.log(`[Telegram] Chat OK: ${id} (${chat.type}${chat.title ? ': ' + chat.title : ''})`);
+    } catch (error) {
+      problems.push(`Cannot reach chat ${id}: ${describeError(error)} (did you press START / add the bot to the group?)`);
+    }
+  }
+
+  return { ok: problems.length === 0, problems };
 }
 
 module.exports = {
@@ -279,4 +353,6 @@ module.exports = {
   formatDealMessage,
   sendDealAlert,
   sendBatchAlerts,
+  verifyTelegram,
+  describeError,
 };
