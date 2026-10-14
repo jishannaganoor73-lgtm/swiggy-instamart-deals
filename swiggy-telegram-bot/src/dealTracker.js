@@ -431,6 +431,8 @@ function findAlertWorthyDeals(
     if (shouldAlert) {
       alertList.push({
         ...item,
+        _itemKey: itemKey,
+        _prevEntry: prev ? JSON.parse(JSON.stringify(prev)) : null,
         price,
         mrp,
         discount,
@@ -543,6 +545,27 @@ function findAlertWorthyDeals(
   return alertList;
 }
 
+/**
+ * Undo the "already alerted" bookkeeping for alerts that could NOT be delivered
+ * to Telegram, so the next run tries to send them again.
+ */
+function revertAlerts(alerts, campaignKey = 'default') {
+  if (!Array.isArray(alerts) || alerts.length === 0) return;
+  const cache = loadCache(campaignKey);
+
+  for (const alert of alerts) {
+    const key = alert._itemKey;
+    if (!key) continue;
+    alertedThisProcess.delete(key);
+
+    if (alert._prevEntry) cache.items[key] = alert._prevEntry;
+    else delete cache.items[key];
+  }
+
+  saveCache(cache, campaignKey);
+  console.warn(`[DealTracker:${campaignKey}] Reverted ${alerts.length} undelivered alerts (will retry next run).`);
+}
+
 function getCachedDeals(campaignKey = 'default', minDiscount = 0) {
   const cache = loadCache(campaignKey);
 
@@ -556,5 +579,6 @@ module.exports = {
   saveCache,
   findAlertWorthyDeals,
   getCachedDeals,
+  revertAlerts,
   getIstContext
 };
