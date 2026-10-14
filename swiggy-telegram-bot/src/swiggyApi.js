@@ -152,6 +152,13 @@ const NOICE_SUB_COLLECTIONS = [
 ];
 
 
+// HTTP status counts of the most recent browser scrape (used by health checks).
+let lastScrapeStats = null;
+
+function getLastScrapeStats() {
+  return lastScrapeStats;
+}
+
 function parseCookieHeader(cookieHeader) {
   return String(cookieHeader || '')
     .split(';')
@@ -180,6 +187,7 @@ function resolveStore(storeConfig = {}) {
 }
 
 async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
+  lastScrapeStats = null;
   const { sid, pid: rawPid, secid } = resolveStore(storeConfig);
   const pid = rawPid || sid;
 
@@ -240,8 +248,10 @@ async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
       const pause = (ms) => new Promise((r) => setTimeout(r, ms));
       const base = `storeId=${encodeURIComponent(sid)}&primaryStoreId=${encodeURIComponent(pid || '')}&secondaryStoreId=${encodeURIComponent(secid || '')}`;
       const rawPages = [];
+      const httpStats = { total: 0, ok: 0 };
 
       async function request(url, init = {}) {
+        httpStats.total++;
         try {
           const res = await fetch(url, {
             ...init,
@@ -253,9 +263,14 @@ async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
               ...(init.headers || {})
             }
           });
-          if (!res.ok) return { ok: false, status: res.status };
+          if (!res.ok) {
+            httpStats[res.status] = (httpStats[res.status] || 0) + 1;
+            return { ok: false, status: res.status };
+          }
+          httpStats.ok++;
           return { ok: true, json: await res.json() };
         } catch (e) {
+          httpStats[0] = (httpStats[0] || 0) + 1;
           return { ok: false, status: 0, error: String(e) };
         }
       }
@@ -417,7 +432,7 @@ async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
         }
       }
 
-      return { results, rawPages };
+      return { results, rawPages, httpStats };
     }, mode, sid, pid, secid, {
       collectionPages: limits.collectionPages,
       keywordPages: limits.keywordPages,
@@ -427,6 +442,8 @@ async function scrapeWithBrowser(mode, storeConfig = {}, options = {}) {
       subcategories: options.subcategories || [],
       categoryObj: options.categoryObj || null
     });
+
+    lastScrapeStats = scraped.httpStats || null;
 
     const map = new Map();
 
@@ -685,5 +702,6 @@ module.exports = {
   fetchWednesdayBazaarDeals,
   fetchCategoryDeals,
   fetchKeywordDeals,
-  fetchEssentialAisleDeals
+  fetchEssentialAisleDeals,
+  getLastScrapeStats
 };
