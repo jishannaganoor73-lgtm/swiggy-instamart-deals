@@ -2,13 +2,25 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config.json');
 const { fetchEssentialAisleDeals, fetchNoiceDeals, getLastScrapeStats } = require('./swiggyApi');
-const { findAlertWorthyDeals } = require('./dealTracker');
-const { sendBatchAlerts } = require('./notifier');
+const { findAlertWorthyDeals, revertAlerts } = require('./dealTracker');
+const { sendBatchAlerts, verifyTelegram } = require('./notifier');
 const { recordPriceObservations } = require('./priceHistory');
 const { validateItems, filterAlerts } = require('./validator');
 const { recordRun, notifyHealth } = require('./health');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Run-wide delivery counters so a silent Telegram failure can fail the job.
+const delivery = { attempted: 0, sent: 0, failed: 0 };
+
+async function deliver(bot, chatId, alerts, opts, campaignKey) {
+  delivery.attempted += alerts.length;
+  const res = await sendBatchAlerts(bot, chatId, alerts, opts);
+  delivery.sent += res.sent.length;
+  delivery.failed += res.failed.length;
+  if (res.failed.length > 0) revertAlerts(res.failed, campaignKey);
+  return res;
+}
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -158,8 +170,8 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
       weeklyCategories
     }), campaignKey);
     console.log(`[${campaignKey}] Found ${alerts.length} alert-worthy deals (Discount ≥ ${threshold}% | Cycle: ${refreshCycle}).`);
-    if (bot && chatId && alerts.length > 0) {
-      await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: headerName });
+    if (alerts.length > 0) {
+      await deliver(bot, chatId, alerts, { timeString, workerInfo: headerName }, campaignKey);
     } else if (!alerts.length) {
       console.log(`[${campaignKey}] No items met the minimum discount threshold (${threshold}%) this run.`);
     }
@@ -176,7 +188,20 @@ async function main() {
   if (token && token !== 'your_bot_token_here') {
     bot = new TelegramBot(token, { polling: false });
   } else {
-    console.warn('[CronRunner] No TELEGRAM_BOT_TOKEN configured. Will scrape and cache without sending Telegram alerts.');
+    console.warn('[CronRunner] No TELEGRAM_BOT_TOKEN configured (or still the placeholder).');
+  }
+
+  if (!chatId) console.warn('[CronRunner] TELEGRAM_CHAT_ID is empty.');
+
+  // Preflight: prove the token + chat work BEFORE scraping, so problems are loud.
+  const tg = await verifyTelegram(bot, [chatId, process.env.PRIORITY_CHAT_ID]);
+  if (!tg.ok) {
+    tg.problems.forEach((p) => console.error(`[Telegram] ❌ ${p}`));
+    console.error('[Telegram] Alerts cannot be delivered. Fix the TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets.');
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      // Fail the job so you actually see it (and the failure-notify job fires).
+      process.exit(1);
+    }
   }
 
   const now = new Date();
@@ -302,12 +327,18 @@ async function main() {
         weeklyResetDay: cfg.weeklyResetDay !== undefined ? cfg.weeklyResetDay : 1
       }), 'noice');
       console.log(`[NOICE] Found ${alerts.length} new/improved deals >= ${noiceThreshold}%.`);
-      if (bot && chatId && alerts.length > 0) {
-        await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: '✨ The NOICE Store' });
+      if (alerts.length > 0) {
+        await deliver(bot, chatId, alerts, { timeString, workerInfo: '✨ The NOICE Store' }, 'noice');
       }
     } catch (e) {
       console.error('[NOICE] Error:', e.message);
     }
+  }
+
+  console.log(`\n[CronRunner] Telegram delivery: ${delivery.sent}/${delivery.attempted} alerts sent, ${delivery.failed} failed.`);
+  if (delivery.failed > 0) {
+    console.error('[CronRunner] ❌ Some alerts could not be delivered to Telegram (see errors above).');
+    process.exit(1);
   }
 
   console.log('\n[CronRunner] Execution finished successfully.');
