@@ -108,6 +108,18 @@ function formatCompactItem(deal, index = null) {
     );
   }
 
+  if (deal.platformLabel) {
+    lines.push('', `🏬 <b>${escapeHtml(deal.platformLabel)}</b>`);
+  }
+
+  if (Number.isFinite(Number(deal.confidence))) {
+    lines.push('', `🎯 Confidence: <b>${escapeHtml(deal.confidenceLevel || '')}</b> (${Math.round(deal.confidence)}%)`);
+  }
+
+  if (Array.isArray(deal.flags) && deal.flags.length > 0) {
+    lines.push(`⚠️ ${deal.flags.map(escapeHtml).join(' · ')}`);
+  }
+
   return lines.join('\n');
 }
 
@@ -126,11 +138,12 @@ function getInlineKeyboard(deal) {
   };
 }
 
-async function sendOneDeal(bot, chatId, deal, index = null) {
+async function sendOneDeal(bot, chatId, deal, index = null, extra = {}) {
   const caption = formatCompactItem(deal, index);
   const options = {
     parse_mode: 'HTML',
     reply_markup: getInlineKeyboard(deal),
+    ...extra,
   };
 
   if (deal.imageUrl) {
@@ -163,6 +176,59 @@ async function sendDealAlert(bot, chatId, deal) {
   }
 }
 
+const PRIORITY_TYPES = new Set(['ONE_RUPEE_DEAL', 'POTENTIAL_PRICE_GLITCH']);
+
+function envFlag(name, fallback) {
+  const v = process.env[name];
+  if (v === undefined || v === '') return fallback;
+  return !['false', '0', 'no', 'off'].includes(String(v).toLowerCase());
+}
+
+function threadExtra(threadId) {
+  const n = Number(threadId);
+  return Number.isFinite(n) && n > 0 ? { message_thread_id: n } : {};
+}
+
+function isPriorityDeal(deal) {
+  const minConfidence = Number(process.env.PRIORITY_MIN_CONFIDENCE) || 50;
+  const confidence = Number.isFinite(Number(deal.confidence)) ? Number(deal.confidence) : 100;
+
+  return PRIORITY_TYPES.has(deal.alertType) && confidence >= minConfidence;
+}
+
+async function sendGroup(bot, chatId, deals, { header, extra }) {
+  if (deals.length === 0) return;
+
+  try {
+    await bot.sendMessage(chatId, header, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  } catch (error) {
+    console.error('[Notifier] Header send failed:', error.message);
+  }
+
+  for (let i = 0; i < deals.length; i++) {
+    try {
+      await sendOneDeal(bot, chatId, deals[i], i + 1, extra);
+    } catch (error) {
+      console.error(`[Notifier] Failed to send deal ${i + 1}:`, error.message);
+    }
+
+    if (i < deals.length - 1) {
+      await sleep(700);
+    }
+  }
+}
+
+/**
+ * Priority routing:
+ *   - Rs 1 deals and price glitches (with enough confidence) go FIRST, with
+ *     sound, to PRIORITY_CHAT_ID (+ optional PRIORITY_THREAD_ID topic).
+ *   - Everything else goes to the normal chat, silently by default
+ *     (QUIET_NORMAL_ALERTS=false to get sound for them too).
+ */
 async function sendBatchAlerts(bot, chatId, deals, options = {}) {
   if (!bot || !chatId || !Array.isArray(deals) || deals.length === 0) {
     return;
@@ -171,35 +237,41 @@ async function sendBatchAlerts(bot, chatId, deals, options = {}) {
   const workerInfo = options.workerInfo || 'INSTAMART DEALS';
   const timeString = options.timeString || '';
 
-  const header = [
+  const priorityChatId = options.priorityChatId || process.env.PRIORITY_CHAT_ID || chatId;
+  const quiet = envFlag('QUIET_NORMAL_ALERTS', true);
+
+  const priorityDeals = deals.filter(isPriorityDeal);
+  const normalDeals = deals.filter((deal) => !isPriorityDeal(deal));
+
+  const priorityHeader = [
+    `🚨 <b>PRIORITY: ${escapeHtml(workerInfo)}</b>`,
+    timeString ? `🕒 ${escapeHtml(timeString)}` : '',
+    `<i>₹1 deals / price glitches — act fast!</i>`,
+  ].filter(Boolean).join('\n');
+
+  const normalHeader = [
     `✨ <b>${escapeHtml(workerInfo)}</b>`,
     timeString ? `🕒 ${escapeHtml(timeString)}` : '',
     `<i>Handpicked deals for you</i>`,
   ].filter(Boolean).join('\n');
 
-  try {
-    await bot.sendMessage(chatId, header, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-    });
-  } catch (error) {
-    console.error('[Notifier] Header send failed:', error.message);
-  }
+  // Priority first, loud.
+  await sendGroup(bot, priorityChatId, priorityDeals, {
+    header: priorityHeader,
+    extra: {
+      disable_notification: false,
+      ...threadExtra(options.priorityThreadId || process.env.PRIORITY_THREAD_ID),
+    },
+  });
 
-  for (let i = 0; i < deals.length; i++) {
-    try {
-      await sendOneDeal(bot, chatId, deals[i], i + 1);
-    } catch (error) {
-      console.error(
-        `[Notifier] Failed to send deal ${i + 1}:`,
-        error.message
-      );
-    }
-
-    if (i < deals.length - 1) {
-      await sleep(700);
-    }
-  }
+  // Then normal deals, quiet by default.
+  await sendGroup(bot, chatId, normalDeals, {
+    header: normalHeader,
+    extra: {
+      disable_notification: quiet,
+      ...threadExtra(options.normalThreadId || process.env.NORMAL_THREAD_ID),
+    },
+  });
 }
 
 module.exports = {
