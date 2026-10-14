@@ -41,9 +41,6 @@ jobs:
           - beverages
           - personal
           - lifestyle
-          - blinkit
-          - zepto
-          - flipkart
 
     steps:
       - name: Checkout Repository
@@ -114,32 +111,6 @@ jobs:
           HEALTH_CHAT_ID: ${{ secrets.HEALTH_CHAT_ID }}
           QUIET_NORMAL_ALERTS: ${{ vars.QUIET_NORMAL_ALERTS }}
           MIN_GLITCH_MRP: ${{ vars.MIN_GLITCH_MRP }}
-
-          # Quick-commerce platforms (only used by the blinkit / zepto / flipkart workers)
-          BLINKIT_EXTRA_HEADERS: ${{ secrets.BLINKIT_EXTRA_HEADERS }}
-          BLINKIT_COOKIE: ${{ secrets.BLINKIT_COOKIE }}
-          BLINKIT_PROXY: ${{ secrets.BLINKIT_PROXY }}
-          BLINKIT_LAT: ${{ secrets.BLINKIT_LAT }}
-          BLINKIT_LON: ${{ secrets.BLINKIT_LON }}
-          BLINKIT_PINCODE: ${{ secrets.BLINKIT_PINCODE }}
-          BLINKIT_STORE_ID: ${{ secrets.BLINKIT_STORE_ID }}
-          BLINKIT_MIN_DISCOUNT: ${{ vars.BLINKIT_MIN_DISCOUNT }}
-          ZEPTO_EXTRA_HEADERS: ${{ secrets.ZEPTO_EXTRA_HEADERS }}
-          ZEPTO_COOKIE: ${{ secrets.ZEPTO_COOKIE }}
-          ZEPTO_PROXY: ${{ secrets.ZEPTO_PROXY }}
-          ZEPTO_LAT: ${{ secrets.ZEPTO_LAT }}
-          ZEPTO_LON: ${{ secrets.ZEPTO_LON }}
-          ZEPTO_PINCODE: ${{ secrets.ZEPTO_PINCODE }}
-          ZEPTO_STORE_ID: ${{ secrets.ZEPTO_STORE_ID }}
-          ZEPTO_MIN_DISCOUNT: ${{ vars.ZEPTO_MIN_DISCOUNT }}
-          FLIPKART_EXTRA_HEADERS: ${{ secrets.FLIPKART_EXTRA_HEADERS }}
-          FLIPKART_COOKIE: ${{ secrets.FLIPKART_COOKIE }}
-          FLIPKART_PROXY: ${{ secrets.FLIPKART_PROXY }}
-          FLIPKART_LAT: ${{ secrets.FLIPKART_LAT }}
-          FLIPKART_LON: ${{ secrets.FLIPKART_LON }}
-          FLIPKART_PINCODE: ${{ secrets.FLIPKART_PINCODE }}
-          FLIPKART_STORE_ID: ${{ secrets.FLIPKART_STORE_ID }}
-          FLIPKART_MIN_DISCOUNT: ${{ vars.FLIPKART_MIN_DISCOUNT }}
 
           USE_BROWSER: 'true'
           SKIP_SYNC: ${{ inputs.skip_sync }}
@@ -253,4 +224,3 @@ jobs:
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=🛑 Deal Hunter: one or more workers FAILED. Details: ${RUN_URL}" \
             --data-urlencode "disable_web_page_preview=true" > /dev/null
-
