@@ -1,10 +1,14 @@
 require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '..', 'platforms.local.env') });
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config.json');
-const { fetchEssentialAisleDeals, fetchNoiceDeals } = require('./swiggyApi');
+const { fetchEssentialAisleDeals, fetchNoiceDeals, getLastScrapeStats } = require('./swiggyApi');
 const { findAlertWorthyDeals } = require('./dealTracker');
 const { sendBatchAlerts } = require('./notifier');
 const { recordPriceObservations } = require('./priceHistory');
+const { validateItems, filterAlerts } = require('./validator');
+const { recordRun, notifyHealth } = require('./health');
+const { loadPlatformConfig, fetchPlatformDeals, getPlatformStats } = require('./platforms/engine');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -18,7 +22,19 @@ const storeConfig = {
   secid: process.env.SWIGGY_SECONDARY_STORE_ID || config.store?.secid || ''
 };
 
-if (!storeConfig.sid) {
+const PLATFORM_MODES = {
+  blinkit: ['blinkit'],
+  zepto: ['zepto'],
+  flipkart: ['flipkart'],
+  flipkartminutes: ['flipkart'],
+  minutes: ['flipkart'],
+  platforms: ['blinkit', 'zepto', 'flipkart']
+};
+
+const _requestedMode = (process.argv.slice(2).find((a) => !a.startsWith('--')) || '').toLowerCase();
+const platformOnlyRun = Object.prototype.hasOwnProperty.call(PLATFORM_MODES, _requestedMode);
+
+if (!storeConfig.sid && !platformOnlyRun) {
   console.error('❌ FATAL: SWIGGY_STORE_ID is missing or empty!');
   console.error('   Please configure SWIGGY_STORE_ID in your GitHub Repository Secrets:');
   console.error('   👉 Settings → Secrets and variables → Actions → New repository secret');
@@ -96,6 +112,7 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
 
   let items = [];
   let attempts = 0;
+  let lastError = null;
   const maxAttempts = 3;
 
   while (attempts < maxAttempts) {
@@ -114,6 +131,7 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
         console.warn(`[${campaignKey}] Attempt ${attempts}/${maxAttempts}: Swiggy returned 0 items (server may be busy).`);
       }
     } catch (e) {
+      lastError = e.message;
       console.error(`[${campaignKey}] Attempt ${attempts}/${maxAttempts} error:`, e.message);
     }
     if (attempts < maxAttempts) {
@@ -122,6 +140,21 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
       await sleep(waitSecs * 1000);
     }
   }
+
+  // Health monitoring: record how this scan went (and alert if it keeps failing).
+  try {
+    const healthEvents = recordRun(campaignKey, {
+      itemCount: (items || []).length,
+      error: lastError,
+      stats: getLastScrapeStats()
+    });
+    await notifyHealth(bot, healthEvents, chatId);
+  } catch (error) {
+    console.error(`[${campaignKey}] Health check failed:`, error.message);
+  }
+
+  // Drop invalid listings (bad MRP, price above MRP, zero price...) before anything else.
+  items = validateItems(items, campaignKey);
 
   if (items.length > 0) {
     try {
@@ -133,11 +166,11 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
     const refreshCycle = campaignCfg.refreshCycle || 'daily';
     const weeklyResetDay = campaignCfg.weeklyResetDay !== undefined ? campaignCfg.weeklyResetDay : 1;
     const weeklyCategories = campaignCfg.weeklyCategories || config.weeklyCategories || ['Electronics and Appliances'];
-    const alerts = findAlertWorthyDeals(items, threshold, campaignKey, {
+    const alerts = filterAlerts(findAlertWorthyDeals(items, threshold, campaignKey, {
       refreshCycle,
       weeklyResetDay,
       weeklyCategories
-    });
+    }), campaignKey);
     console.log(`[${campaignKey}] Found ${alerts.length} alert-worthy deals (Discount ≥ ${threshold}% | Cycle: ${refreshCycle}).`);
     if (bot && chatId && alerts.length > 0) {
       await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: headerName });
@@ -146,6 +179,88 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
     }
   } else {
     console.error(`[${campaignKey}] All retry attempts failed or returned 0 items.`);
+  }
+}
+
+async function runPlatformCampaign(platformKey, options = {}) {
+  const { bot, chatId, timeString, glitchSweep, glitchThreshold } = options;
+
+  let cfg;
+  try {
+    cfg = loadPlatformConfig().platforms[platformKey];
+  } catch (error) {
+    console.error(`[${platformKey}] Could not read platforms.config.json:`, error.message);
+    return;
+  }
+
+  if (!cfg || !cfg.enabled || !Array.isArray(cfg.requests) || cfg.requests.length === 0) {
+    console.log(`[${platformKey}] Skipped: platform disabled or no requests configured (see README: platform:import).`);
+    return;
+  }
+
+  const label = `${cfg.emoji || '🛍️'} ${cfg.name || platformKey}`;
+  const threshold = glitchSweep
+    ? glitchThreshold
+    : parseInt(process.env[`${platformKey.toUpperCase()}_MIN_DISCOUNT`], 10) || cfg.minDiscount || 60;
+
+  console.log(`\n--- Running ${label} (${cfg.requests.length} requests) ---`);
+
+  let items = [];
+  let lastError = null;
+  const maxAttempts = 2;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      items = await fetchPlatformDeals(platformKey, cfg);
+      if (items.length > 0) break;
+      console.warn(`[${platformKey}] Attempt ${attempt}/${maxAttempts}: 0 products.`);
+    } catch (error) {
+      lastError = error.message;
+      console.error(`[${platformKey}] Attempt ${attempt}/${maxAttempts} error:`, error.message);
+    }
+
+    if (attempt < maxAttempts) {
+      console.log(`[${platformKey}] Waiting 45s before retry...`);
+      await sleep(45 * 1000);
+    }
+  }
+
+  try {
+    const healthEvents = recordRun(platformKey, {
+      itemCount: items.length,
+      error: lastError,
+      stats: getPlatformStats(platformKey)
+    });
+    await notifyHealth(bot, healthEvents, chatId);
+  } catch (error) {
+    console.error(`[${platformKey}] Health check failed:`, error.message);
+  }
+
+  items = validateItems(items, platformKey).map((item) => ({ ...item, platformLabel: cfg.name || platformKey }));
+
+  if (items.length === 0) {
+    console.error(`[${platformKey}] No valid products this run.`);
+    return;
+  }
+
+  try {
+    recordPriceObservations(items, platformKey);
+  } catch (error) {
+    console.error(`[${platformKey}] Price history recording failed:`, error.message);
+  }
+
+  const alerts = filterAlerts(
+    findAlertWorthyDeals(items, threshold, platformKey, {
+      refreshCycle: cfg.refreshCycle || 'daily',
+      weeklyResetDay: cfg.weeklyResetDay !== undefined ? cfg.weeklyResetDay : 1
+    }),
+    platformKey
+  );
+
+  console.log(`[${platformKey}] Found ${alerts.length} alert-worthy deals (Discount ≥ ${threshold}%).`);
+
+  if (bot && chatId && alerts.length > 0) {
+    await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: label });
   }
 }
 
@@ -187,6 +302,7 @@ async function main() {
   let runFresh = false, runGrocery = false, runTreats = false;
   let runMunchies = false, runBeverages = false, runPersonal = false;
   let runLifestyle = false, runNoice = false;
+  let platformsToRun = [];
 
   if (mode === 'fresh' || mode === 'produce') runFresh = true;
   else if (mode === 'grocery' || mode === 'staples') runGrocery = true;
@@ -198,10 +314,12 @@ async function main() {
   else if (mode === 'beverages' || mode === 'drinks' || mode === 'juices') runBeverages = true;
   else if (mode === 'personal' || mode === 'personalcare') runPersonal = true;
   else if (mode === 'noice') runNoice = true;
+  else if (PLATFORM_MODES[mode]) platformsToRun = PLATFORM_MODES[mode];
   else if (mode === 'all' || mode === 'glitch') {
     // Full sweep: every category/aisle + NOICE store, ignoring the operating-hours window.
     runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
     runBeverages = true; runPersonal = true; runLifestyle = true; runNoice = true;
+    platformsToRun = PLATFORM_MODES.platforms;
   } else if (isWithinHours) {
     runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
     runBeverages = true; runPersonal = true; runLifestyle = true;
@@ -254,18 +372,34 @@ async function main() {
     console.log('\n--- Running The NOICE Store Scan ---');
     const cfg = campaigns.noice || {};
     const noiceThreshold = glitchSweep ? glitchThreshold : parseInt(process.env.NOICE_MIN_DISCOUNT, 10) || cfg.minDiscount || minDiscount || 50;
+    let noiceError = null;
     try {
-      const items = await fetchNoiceDeals(storeConfig);
+      let items = [];
+      try {
+        items = await fetchNoiceDeals(storeConfig);
+      } catch (e) {
+        noiceError = e.message;
+        console.error('[NOICE] Fetch error:', e.message);
+      }
       console.log(`[NOICE] Scraped ${items.length} items.`);
+
+      const noiceHealth = recordRun('noice', {
+        itemCount: items.length,
+        error: noiceError,
+        stats: getLastScrapeStats()
+      });
+      await notifyHealth(bot, noiceHealth, chatId);
+
+      items = validateItems(items, 'noice');
       try {
         recordPriceObservations(items, 'noice');
       } catch (error) {
         console.error('[NOICE] Price history recording failed:', error.message);
       }
-      const alerts = findAlertWorthyDeals(items, noiceThreshold, 'noice', {
+      const alerts = filterAlerts(findAlertWorthyDeals(items, noiceThreshold, 'noice', {
         refreshCycle: cfg.refreshCycle || 'weekly',
         weeklyResetDay: cfg.weeklyResetDay !== undefined ? cfg.weeklyResetDay : 1
-      });
+      }), 'noice');
       console.log(`[NOICE] Found ${alerts.length} new/improved deals >= ${noiceThreshold}%.`);
       if (bot && chatId && alerts.length > 0) {
         await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: '✨ The NOICE Store' });
@@ -273,6 +407,10 @@ async function main() {
     } catch (e) {
       console.error('[NOICE] Error:', e.message);
     }
+  }
+
+  for (const platformKey of platformsToRun) {
+    await runPlatformCampaign(platformKey, { bot, chatId, timeString, glitchSweep, glitchThreshold });
   }
 
   console.log('\n[CronRunner] Execution finished successfully.');
