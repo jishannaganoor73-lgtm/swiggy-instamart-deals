@@ -1,5 +1,4 @@
 require('dotenv').config();
-require('dotenv').config({ path: require('path').join(__dirname, '..', 'platforms.local.env') });
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config.json');
 const { fetchEssentialAisleDeals, fetchNoiceDeals, getLastScrapeStats } = require('./swiggyApi');
@@ -8,7 +7,6 @@ const { sendBatchAlerts } = require('./notifier');
 const { recordPriceObservations } = require('./priceHistory');
 const { validateItems, filterAlerts } = require('./validator');
 const { recordRun, notifyHealth } = require('./health');
-const { loadPlatformConfig, fetchPlatformDeals, getPlatformStats } = require('./platforms/engine');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -22,19 +20,7 @@ const storeConfig = {
   secid: process.env.SWIGGY_SECONDARY_STORE_ID || config.store?.secid || ''
 };
 
-const PLATFORM_MODES = {
-  blinkit: ['blinkit'],
-  zepto: ['zepto'],
-  flipkart: ['flipkart'],
-  flipkartminutes: ['flipkart'],
-  minutes: ['flipkart'],
-  platforms: ['blinkit', 'zepto', 'flipkart']
-};
-
-const _requestedMode = (process.argv.slice(2).find((a) => !a.startsWith('--')) || '').toLowerCase();
-const platformOnlyRun = Object.prototype.hasOwnProperty.call(PLATFORM_MODES, _requestedMode);
-
-if (!storeConfig.sid && !platformOnlyRun) {
+if (!storeConfig.sid) {
   console.error('❌ FATAL: SWIGGY_STORE_ID is missing or empty!');
   console.error('   Please configure SWIGGY_STORE_ID in your GitHub Repository Secrets:');
   console.error('   👉 Settings → Secrets and variables → Actions → New repository secret');
@@ -182,88 +168,6 @@ async function runSubcategoryCampaign(campaignKey, campaignCfg, options = {}) {
   }
 }
 
-async function runPlatformCampaign(platformKey, options = {}) {
-  const { bot, chatId, timeString, glitchSweep, glitchThreshold } = options;
-
-  let cfg;
-  try {
-    cfg = loadPlatformConfig().platforms[platformKey];
-  } catch (error) {
-    console.error(`[${platformKey}] Could not read platforms.config.json:`, error.message);
-    return;
-  }
-
-  if (!cfg || !cfg.enabled || !Array.isArray(cfg.requests) || cfg.requests.length === 0) {
-    console.log(`[${platformKey}] Skipped: platform disabled or no requests configured (see README: platform:import).`);
-    return;
-  }
-
-  const label = `${cfg.emoji || '🛍️'} ${cfg.name || platformKey}`;
-  const threshold = glitchSweep
-    ? glitchThreshold
-    : parseInt(process.env[`${platformKey.toUpperCase()}_MIN_DISCOUNT`], 10) || cfg.minDiscount || 60;
-
-  console.log(`\n--- Running ${label} (${cfg.requests.length} requests) ---`);
-
-  let items = [];
-  let lastError = null;
-  const maxAttempts = 2;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      items = await fetchPlatformDeals(platformKey, cfg);
-      if (items.length > 0) break;
-      console.warn(`[${platformKey}] Attempt ${attempt}/${maxAttempts}: 0 products.`);
-    } catch (error) {
-      lastError = error.message;
-      console.error(`[${platformKey}] Attempt ${attempt}/${maxAttempts} error:`, error.message);
-    }
-
-    if (attempt < maxAttempts) {
-      console.log(`[${platformKey}] Waiting 45s before retry...`);
-      await sleep(45 * 1000);
-    }
-  }
-
-  try {
-    const healthEvents = recordRun(platformKey, {
-      itemCount: items.length,
-      error: lastError,
-      stats: getPlatformStats(platformKey)
-    });
-    await notifyHealth(bot, healthEvents, chatId);
-  } catch (error) {
-    console.error(`[${platformKey}] Health check failed:`, error.message);
-  }
-
-  items = validateItems(items, platformKey).map((item) => ({ ...item, platformLabel: cfg.name || platformKey }));
-
-  if (items.length === 0) {
-    console.error(`[${platformKey}] No valid products this run.`);
-    return;
-  }
-
-  try {
-    recordPriceObservations(items, platformKey);
-  } catch (error) {
-    console.error(`[${platformKey}] Price history recording failed:`, error.message);
-  }
-
-  const alerts = filterAlerts(
-    findAlertWorthyDeals(items, threshold, platformKey, {
-      refreshCycle: cfg.refreshCycle || 'daily',
-      weeklyResetDay: cfg.weeklyResetDay !== undefined ? cfg.weeklyResetDay : 1
-    }),
-    platformKey
-  );
-
-  console.log(`[${platformKey}] Found ${alerts.length} alert-worthy deals (Discount ≥ ${threshold}%).`);
-
-  if (bot && chatId && alerts.length > 0) {
-    await sendBatchAlerts(bot, chatId, alerts, { timeString, workerInfo: label });
-  }
-}
-
 async function main() {
   console.log(`[CronRunner] Mode: ${mode.toUpperCase()} | Store: ${storeConfig.sid}`);
   await syncToHourMark(skipSync);
@@ -302,7 +206,6 @@ async function main() {
   let runFresh = false, runGrocery = false, runTreats = false;
   let runMunchies = false, runBeverages = false, runPersonal = false;
   let runLifestyle = false, runNoice = false;
-  let platformsToRun = [];
 
   if (mode === 'fresh' || mode === 'produce') runFresh = true;
   else if (mode === 'grocery' || mode === 'staples') runGrocery = true;
@@ -314,12 +217,10 @@ async function main() {
   else if (mode === 'beverages' || mode === 'drinks' || mode === 'juices') runBeverages = true;
   else if (mode === 'personal' || mode === 'personalcare') runPersonal = true;
   else if (mode === 'noice') runNoice = true;
-  else if (PLATFORM_MODES[mode]) platformsToRun = PLATFORM_MODES[mode];
   else if (mode === 'all' || mode === 'glitch') {
     // Full sweep: every category/aisle + NOICE store, ignoring the operating-hours window.
     runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
     runBeverages = true; runPersonal = true; runLifestyle = true; runNoice = true;
-    platformsToRun = PLATFORM_MODES.platforms;
   } else if (isWithinHours) {
     runFresh = true; runGrocery = true; runTreats = true; runMunchies = true;
     runBeverages = true; runPersonal = true; runLifestyle = true;
@@ -407,10 +308,6 @@ async function main() {
     } catch (e) {
       console.error('[NOICE] Error:', e.message);
     }
-  }
-
-  for (const platformKey of platformsToRun) {
-    await runPlatformCampaign(platformKey, { bot, chatId, timeString, glitchSweep, glitchThreshold });
   }
 
   console.log('\n[CronRunner] Execution finished successfully.');
