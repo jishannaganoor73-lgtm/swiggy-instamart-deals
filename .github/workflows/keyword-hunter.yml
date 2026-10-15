@@ -1,15 +1,23 @@
+
 name: Swiggy Instamart Keyword Deal Hunter
 
 on:
   schedule:
-    # Approximately every 30 minutes during configured UTC hours.
-    - cron: '31 3-18 * * *'
-    - cron: '1 4-18 * * *'
+    # Every 15 minutes, offset from :00 to reduce GitHub schedule congestion.
+    # IST operating window: approximately 09:07 through 23:52.
+    - cron: '37,52 3 * * *'
+    - cron: '7,22,37,52 4-17 * * *'
+    - cron: '7,22 18 * * *'
 
   workflow_dispatch:
     inputs:
       skip_sync:
         description: 'Skip top-of-hour wait sync (run immediately)'
+        type: boolean
+        required: false
+        default: false
+      test_telegram:
+        description: 'Send a Telegram test message first (diagnose missing alerts)'
         type: boolean
         required: false
         default: false
@@ -31,7 +39,6 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 4
-
       matrix:
         worker:
           - fresh
@@ -57,7 +64,16 @@ jobs:
         working-directory: swiggy-telegram-bot
         run: npm ci || npm install
 
-      # Restore the latest available cache for this worker.
+      - name: Telegram Connection Test
+        if: ${{ inputs.test_telegram }}
+        working-directory: swiggy-telegram-bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PRIORITY_CHAT_ID: ${{ secrets.PRIORITY_CHAT_ID }}
+          HEALTH_CHAT_ID: ${{ secrets.HEALTH_CHAT_ID }}
+        run: node src/telegram-check.js
+
       - name: Restore Deal Cache
         uses: actions/cache/restore@v4
         with:
@@ -66,7 +82,6 @@ jobs:
           restore-keys: |
             deal-cache-${{ matrix.worker }}-
 
-      # Remove only this worker's previous observation file.
       - name: Remove Stale Price Observations
         working-directory: swiggy-telegram-bot
         shell: bash
@@ -104,7 +119,9 @@ jobs:
           BEVERAGES_MIN_DISCOUNT: ${{ secrets.BEVERAGES_MIN_DISCOUNT }}
           PERSONAL_MIN_DISCOUNT: ${{ secrets.PERSONAL_MIN_DISCOUNT }}
 
-          # Optional: priority routing, validation and health settings
+          ALERT_MODE: 'best_deals'
+          BEST_DEAL_MIN_DISCOUNT: '50'
+
           PRIORITY_CHAT_ID: ${{ secrets.PRIORITY_CHAT_ID }}
           PRIORITY_THREAD_ID: ${{ secrets.PRIORITY_THREAD_ID }}
           NORMAL_THREAD_ID: ${{ secrets.NORMAL_THREAD_ID }}
@@ -127,7 +144,6 @@ jobs:
           echo "Executing worker: ${{ matrix.worker }}"
           node src/cron-runner.js "${{ matrix.worker }}" $EXTRA_FLAGS
 
-      # Save the worker cache.
       - name: Save Deal Cache
         uses: actions/cache/save@v4
         if: always()
@@ -135,7 +151,6 @@ jobs:
           path: swiggy-telegram-bot/data
           key: deal-cache-${{ matrix.worker }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Upload only the current worker's observation file.
       - name: Upload Price Observations
         if: always()
         uses: actions/upload-artifact@v4
@@ -198,8 +213,6 @@ jobs:
             git push
           fi
 
-  # Tells you on Telegram when any worker job crashes or times out
-  # (a worker can't report its own hard failure).
   notify-failures:
     name: Notify On Worker Failure
     needs: hunt
