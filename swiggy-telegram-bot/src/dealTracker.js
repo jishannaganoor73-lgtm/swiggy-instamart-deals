@@ -229,7 +229,7 @@ function getSpecialType(price, discount, mrp) {
 }
 
 // A repeat alert for the same product needs a REAL improvement, not noise.
-const MIN_PRICE_IMPROVEMENT_RATIO = 0.90; // must be >= 10% cheaper than last alert
+const MIN_PRICE_IMPROVEMENT_RATIO = 0.85; // require at least a 15% decrease from the last alerted price
 
 const ALERT_PRIORITY = {
   ONE_RUPEE_DEAL: 4,
@@ -399,7 +399,7 @@ function findAlertWorthyDeals(
             (ALERT_PRIORITY[previousType] || 0);
         if (!shouldAlert) suppressionReasons.samePrice += 1;
       } else if (priceIsLower) {
-        // Only a meaningful drop (>= 10% below the last ALERTED price) or a
+        // Only a meaningful drop (>= 15% below the last ALERTED price) or a
         // fall to Rs 1 counts; tiny wobbles are ignored.
         shouldAlert =
           price <= previousPrice * MIN_PRICE_IMPROVEMENT_RATIO ||
