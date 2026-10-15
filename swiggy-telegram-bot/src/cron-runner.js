@@ -24,7 +24,23 @@ async function deliver(bot, chatId, alerts, opts, campaignKey) {
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
-const minDiscount = parseInt(process.env.MIN_DISCOUNT_PERCENT, 10) || config.minDiscount || 70;
+const minDiscount = Number.isFinite(Number.parseInt(process.env.MIN_DISCOUNT_PERCENT, 10))
+  ? Number.parseInt(process.env.MIN_DISCOUNT_PERCENT, 10)
+  : (config.minDiscount ?? 70);
+
+// In all_price_drops mode, alert on every valid discounted listing and every
+// subsequent price decrease; do not let old per-worker discount secrets block it.
+function getCampaignThreshold(envValue, configuredValue, fallback) {
+  const alertMode = String(process.env.ALERT_MODE || '').toLowerCase();
+  if (alertMode === 'all_price_drops') return 0;
+  if (alertMode === 'best_deals') {
+    const bestDealThreshold = Number.parseInt(process.env.BEST_DEAL_MIN_DISCOUNT, 10);
+    return Number.isFinite(bestDealThreshold) ? bestDealThreshold : 50;
+  }
+  const parsed = Number.parseInt(envValue, 10);
+  if (Number.isFinite(parsed)) return parsed; // explicitly allow 0
+  return configuredValue ?? fallback;
+}
 
 const storeConfig = {
   sid: process.env.SWIGGY_STORE_ID || config.store?.sid || '',
@@ -69,9 +85,12 @@ async function syncToHourMark(skip = false, targetBufferSecs = 30) {
   const isGitHubScheduled = process.env.GITHUB_EVENT_NAME === 'schedule';
 
   if (isGitHubScheduled) {
-    const delayMins = mins >= 30 ? mins - 30 : mins;
+    // Workflow slots are :07, :22, :37 and :52 IST/UTC-minute positions.
+    // Find the most recent slot; abort stale runs rather than alerting on old prices.
+    const slot = mins >= 52 ? 52 : mins >= 37 ? 37 : mins >= 22 ? 22 : mins >= 7 ? 7 : -8;
+    const delayMins = mins - slot;
     if (delayMins > 15) {
-      console.warn(`[Sync] ⚠️ GitHub Actions runner queue was delayed by ~${delayMins}m past the target slot (:01/:31).`);
+      console.warn(`[Sync] ⚠️ GitHub Actions runner queue was delayed by ~${delayMins}m past the most recent 15-minute slot.`);
       console.warn(`[Sync] Current time is ${String(istNow.getUTCHours()).padStart(2, '0')}:${String(mins).padStart(2, '0')} IST.`);
       console.warn('[Sync] Aborting stale scheduled run to avoid sending outdated deals.');
       process.exit(0);
@@ -260,44 +279,44 @@ async function main() {
 
   if (runFresh) {
     const cfg = campaigns.fresh || campaigns.essentials || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.FRESH_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.FRESH_MIN_DISCOUNT ?? process.env.ESSENTIALS_MIN_DISCOUNT, cfg.minDiscount, 60);
     await runSubcategoryCampaign('fresh', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runGrocery) {
     const cfg = campaigns.grocery || campaigns.essentials || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.GROCERY_MIN_DISCOUNT || process.env.ESSENTIALS_MIN_DISCOUNT, 10) || cfg.minDiscount || 60;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.GROCERY_MIN_DISCOUNT ?? process.env.ESSENTIALS_MIN_DISCOUNT, cfg.minDiscount, 60);
     await runSubcategoryCampaign('grocery', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runTreats) {
     const cfg = campaigns.treats || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.TREATS_MIN_DISCOUNT, cfg.minDiscount, 70);
     await runSubcategoryCampaign('treats', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runMunchies) {
     const cfg = campaigns.munchies || campaigns.treats || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.MUNCHIES_MIN_DISCOUNT || process.env.TREATS_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.MUNCHIES_MIN_DISCOUNT ?? process.env.TREATS_MIN_DISCOUNT, cfg.minDiscount, 70);
     await runSubcategoryCampaign('munchies', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runBeverages) {
     const cfg = campaigns.beverages || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.BEVERAGES_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.BEVERAGES_MIN_DISCOUNT, cfg.minDiscount, 70);
     await runSubcategoryCampaign('beverages', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runPersonal) {
     const cfg = campaigns.personalCare || campaigns.personal || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.PERSONAL_MIN_DISCOUNT, 10) || cfg.minDiscount || 70;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.PERSONAL_MIN_DISCOUNT, cfg.minDiscount, 70);
     await runSubcategoryCampaign('personalCare', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
   if (runLifestyle) {
     const cfg = campaigns.lifestyle || {};
-    const threshold = glitchSweep ? glitchThreshold : parseInt(process.env.LIFESTYLE_MIN_DISCOUNT, 10) || cfg.minDiscount || 85;
+    const threshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.LIFESTYLE_MIN_DISCOUNT, cfg.minDiscount, 35);
     await runSubcategoryCampaign('lifestyle', cfg, { bot, chatId, storeConfig, threshold, timeString });
   }
 
   if (runNoice) {
     console.log('\n--- Running The NOICE Store Scan ---');
     const cfg = campaigns.noice || {};
-    const noiceThreshold = glitchSweep ? glitchThreshold : parseInt(process.env.NOICE_MIN_DISCOUNT, 10) || cfg.minDiscount || minDiscount || 50;
+    const noiceThreshold = glitchSweep ? glitchThreshold : getCampaignThreshold(process.env.NOICE_MIN_DISCOUNT, cfg.minDiscount, minDiscount || 50);
     let noiceError = null;
     try {
       let items = [];
